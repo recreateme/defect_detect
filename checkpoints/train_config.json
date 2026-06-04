@@ -1,0 +1,13 @@
+{
+  "img_size": 128,
+  "num_classes": 5,
+  "classes": [
+    "局部破损",
+    "断钻",
+    "棱边朝上",
+    "点朝上",
+    "面朝上"
+  ],
+  "best_val_acc": 0.95155,
+  "model_arch": "efficientnet_b0"
+}

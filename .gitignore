@@ -1,0 +1,98 @@
+# ==============================
+# 数据集（体积大，不纳入版本库）
+# ==============================
+data/
+
+# ==============================
+# 训练 / 推理产物（自动生成，checkpoints 需纳入版本库）
+# ==============================
+outputs/
+corrections/
+app_config.json
+
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 测试 / 类型检查 / 打包缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+*.cover
+*.py,cover
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ==============================
+# IDE / 编辑器
+# ==============================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ==============================
+# 系统与隐藏文件（以 . 开头的常见项）
+# 注意：不使用 .* 通配，避免误忽略 .gitignore 本身
+# ==============================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+.directory
+
+# 环境与密钥（勿提交）
+.env
+.env.*
+!.env.example
+
+# 日志与临时文件
+*.log
+*.tmp
+*.temp
+*.bak
+
+# 大体积模型权重（仅忽略项目根目录散落文件，不忽略 checkpoints/）
+/*.pt
+/*.pth
+/*.onnx
+/*.h5
+/*.ckpt
