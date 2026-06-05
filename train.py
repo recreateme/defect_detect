@@ -2,14 +2,37 @@
 # -*- coding: utf-8 -*-
 """
 图像缺陷分类模型训练管线
-  · 模型  : EfficientNet-B0（torchvision 迁移学习）
-  · 策略  : 两阶段微调 —— 先冻结 Backbone 训练分类头，再端到端微调
-  · 增强  : 默认适配离线已增强数据（轻量在线增强）；原始数据可 --no_pre_augmented
-  · 导出  : .pt（PyTorch 原生，GPU 推理）+ .onnx（ONNXRuntime，CPU 推理）
+================================================================================
 
-用法:
-    python train.py
-    python train.py --data_dir data --img_size 128 --batch_size 32 --epochs_phase1 5 --epochs_phase2 20
+【架构概览】
+  · 模型  : EfficientNet-B0（torchvision ImageNet 迁移学习，小样本场景首选）
+  · 策略  : 两阶段微调
+            阶段一 — 冻结 Backbone，仅训练 Dropout + Linear 分类头（快速对齐类别）
+            阶段二 — 解冻全部层，Backbone 与 Head 分层学习率端到端微调
+  · 增强  : 默认适配「离线已增强」数据（轻量在线增强）；原始图用 --no_pre_augmented
+  · 不均衡: 四层策略（详见下方「四层不均衡学习」）
+  · 导出  : best_model.pt（GPU/PyTorch）+ model.onnx（CPU/ONNXRuntime）+ 阈值 JSON
+
+【四层不均衡学习】（类别样本数差异大时必须关注 Macro-F1，而非 Accuracy）
+  第一层 · 采样   : WeightedRandomSampler（原始数据）或 shuffle（离线增强数据）
+  第二层 · 损失   : CrossEntropy / FocalLoss 中传入逆频类别权重
+  第三层 · Focal  : (1-p_t)^γ 聚焦难分样本，默认 γ=2
+  第四层 · 评估   : 以 val_macro_f1 保存最优模型；验证集逐类搜索 class_thresholds.json
+
+【路径约定】
+  PROJECT_ROOT = 本文件所在目录。所有相对路径均相对项目根解析，
+  可从任意工作目录启动，例如:
+    python "D:/.../defects_classify/train.py" --data_dir data --img_size 128
+
+【常用命令】
+  从头训练:
+    python train.py --data_dir data --img_size 128
+  合并 corrections 增量微调:
+    python train.py --finetune --extra_data_dirs corrections
+  仅补跑阈值校准与 ONNX（不重训）:
+    python train.py --postprocess_only
+  指定 checkpoint 继续训练:
+    python train.py --resume checkpoints/best_model.pt --epochs_phase1 0
 """
 
 import os
@@ -19,7 +42,12 @@ import time
 import argparse
 import warnings
 from pathlib import Path
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional, Any
+
+# ── 项目根目录 ──────────────────────────────────────────────────────────────
+# 无论用户在哪个 shell 目录执行 python，data/、checkpoints/ 等相对路径
+# 都解析到此目录下，避免出现「No such file or directory」。
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 import numpy as np
 import torch
@@ -28,6 +56,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 import torchvision.transforms as T
 import torchvision.models as models
+import torch.nn.functional as F
 from PIL import Image
 
 # 可选依赖（缺失时跳过对应功能）
@@ -75,6 +104,161 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # ═══════════════════════════════════════════════
+# 路径解析（相对项目根，避免 No such file or directory）
+# ═══════════════════════════════════════════════
+def resolve_project_path(
+    path: "str | Path",
+    *,
+    must_exist: bool = False,
+    kind: str = "路径",
+    create_parent: bool = False,
+) -> Path:
+    """
+    将相对路径解析为基于 PROJECT_ROOT 的绝对路径。
+    用户从任意目录执行 python .../train.py 时，--data_dir data 仍指向项目内 data/。
+    """
+    raw = str(path)
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    try:
+        p = p.resolve()
+    except OSError as e:
+        raise FileNotFoundError(
+            f"无法解析{kind}: {raw}\n"
+            f"  项目根目录: {PROJECT_ROOT}\n"
+            f"  错误: {e}"
+        ) from e
+
+    if must_exist and not p.exists():
+        hint = (
+            f"\n  项目根目录: {PROJECT_ROOT}\n"
+            f"  解析后路径: {p}\n"
+            f"  启动前工作目录: {os.getcwd()}\n"
+            f"提示: 使用相对项目根的路径，例如 --data_dir data；\n"
+            f"  或: python \"{PROJECT_ROOT / 'train.py'}\" --data_dir data --img_size 128"
+        )
+        if kind == "数据目录":
+            data_candidate = PROJECT_ROOT / "data"
+            if data_candidate.is_dir():
+                hint += f"\n  检测到 {data_candidate} 存在，请确认 --data_dir 参数。"
+            else:
+                hint += f"\n  未找到默认目录 {data_candidate}，请先准备数据集。"
+        raise FileNotFoundError(f"{kind}不存在: {raw}{hint}")
+
+    if create_parent and not p.exists():
+        p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def normalize_training_paths(args: argparse.Namespace) -> argparse.Namespace:
+    """解析并校验所有路径参数，并将工作目录切换到项目根。"""
+    try:
+        os.chdir(PROJECT_ROOT)
+    except OSError:
+        pass
+
+    args.data_dir = resolve_project_path(
+        args.data_dir, must_exist=True, kind="数据目录"
+    )
+    args.save_dir = resolve_project_path(
+        args.save_dir, create_parent=True, kind="输出目录"
+    )
+
+    resolved_extra: List[Path] = []
+    for d in args.extra_data_dirs or []:
+        try:
+            resolved_extra.append(
+                resolve_project_path(d, must_exist=True, kind="额外数据目录")
+            )
+        except FileNotFoundError as exc:
+            print(f"  [跳过] {exc}")
+    args.extra_data_dirs = resolved_extra
+
+    resume_raw = (args.resume or "").strip()
+    if resume_raw.lower() == "auto":
+        cand = args.save_dir / "best_model.pt"
+        args.resume_path = cand if cand.is_file() else None
+    elif resume_raw:
+        args.resume_path = resolve_project_path(
+            resume_raw, must_exist=True, kind="Checkpoint"
+        )
+    else:
+        args.resume_path = None
+
+    if args.finetune and args.resume_path is None:
+        auto_ckpt = args.save_dir / "best_model.pt"
+        if auto_ckpt.is_file():
+            args.resume_path = auto_ckpt
+            print(f"  [--finetune] 自动加载 {auto_ckpt}")
+
+    if args.finetune and args.epochs_phase1 > 0:
+        print("  [--finetune] 跳过阶段一（仅端到端微调）")
+        args.epochs_phase1 = 0
+
+    if args.postprocess_only and not args.resume_path:
+        auto_ckpt = args.save_dir / "best_model.pt"
+        if auto_ckpt.is_file():
+            args.resume_path = auto_ckpt
+
+    return args
+
+
+# ═══════════════════════════════════════════════
+# 不均衡学习 · 第三层损失 + 第四层评估指标
+# ═══════════════════════════════════════════════
+# 与第一层（Sampler）、第二层（CE weight）配合使用，形成完整不均衡方案。
+class FocalLoss(nn.Module):
+    """
+    Focal Loss — 自动聚焦难分样本，缓解类别不均衡。
+    FL(p_t) = -α_t · (1 - p_t)^γ · log(p_t)
+
+    γ=0 退化为普通 CrossEntropy；γ=2 为经典设置。
+    weight: 与 CrossEntropyLoss.weight 语义相同（类别逆频权重，第二层）。
+    """
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor = None):
+        super().__init__()
+        self.gamma  = gamma
+        self.weight = weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # log_p / p : 各类别 log-softmax 与概率
+        log_p = F.log_softmax(logits, dim=1)
+        p     = torch.exp(log_p)
+        # p_t : 仅取「真实类别」对应的预测概率（难样本 p_t 小 → focal 权重大）
+        log_pt = log_p.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt     = p.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal  = (1.0 - pt) ** self.gamma
+        loss   = -focal * log_pt
+        # 第二层类别权重：少数类算错时梯度进一步放大
+        if self.weight is not None:
+            w = self.weight.to(targets.device)
+            loss = loss * w[targets]
+        return loss.mean()
+
+    def extra_repr(self) -> str:
+        return f"gamma={self.gamma}, weighted={self.weight is not None}"
+
+
+def compute_macro_f1(all_preds: np.ndarray, all_labels: np.ndarray) -> float:
+    """
+    Macro-F1：对每类 F1 取简单平均（第四层评估指标）。
+    少数类 F1 偏低会直接拉低整体，比 Accuracy 更能反映不均衡数据表现。
+    """
+    classes_seen = np.unique(all_labels)
+    f1_list = []
+    for c in classes_seen:
+        tp  = np.sum((all_preds == c) & (all_labels == c))
+        fp  = np.sum((all_preds == c) & (all_labels != c))
+        fn  = np.sum((all_preds != c) & (all_labels == c))
+        pre = tp / (tp + fp + 1e-9)
+        rec = tp / (tp + fn + 1e-9)
+        f1  = 2 * pre * rec / (pre + rec + 1e-9)
+        f1_list.append(f1)
+    return float(np.mean(f1_list)) if f1_list else 0.0
+
+
+# ═══════════════════════════════════════════════
 # 混合精度（兼容 PyTorch 2.x 新 API）
 # ═══════════════════════════════════════════════
 def create_grad_scaler(enabled: bool):
@@ -101,7 +285,7 @@ def amp_autocast(enabled: bool):
 
 
 # ═══════════════════════════════════════════════
-# 配置
+# 命令行参数（分组说明见 README「训练参数建议」）
 # ═══════════════════════════════════════════════
 def get_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="缺陷分类模型训练")
@@ -127,13 +311,20 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--patience",       type=int,   default=8,
                    help="Early Stopping 耐心轮数")
     p.add_argument("--pre_augmented",  action="store_true", default=True,
-                   help="数据已离线增强：使用轻量在线增强 + 加权损失（默认开启）")
+                   help="数据已离线增强：轻量在线增强 + shuffle（默认开启）")
     p.add_argument("--no_pre_augmented", dest="pre_augmented", action="store_false",
-                   help="数据未增强：启用完整在线增强与 WeightedRandomSampler")
-    p.add_argument("--weighted_loss",  action="store_true", default=True,
-                   help="CrossEntropyLoss 使用类别反频率权重（默认开启）")
-    p.add_argument("--no_weighted_loss", dest="weighted_loss", action="store_false",
+                   help="数据未增强：完整在线增强 + WeightedRandomSampler（第一层）")
+    # 不均衡学习（第二～四层）
+    p.add_argument("--use_class_weight", action="store_true", default=True,
+                   help="损失函数中加入逆频类别权重（第二层，默认开启）")
+    p.add_argument("--no_class_weight", dest="use_class_weight", action="store_false",
                    help="关闭损失函数类别加权")
+    p.add_argument("--use_focal_loss", action="store_true", default=True,
+                   help="使用 Focal Loss 替换 CrossEntropy（第三层，默认开启）")
+    p.add_argument("--no_focal_loss", dest="use_focal_loss", action="store_false",
+                   help="关闭 Focal Loss，改用加权 CrossEntropy")
+    p.add_argument("--focal_gamma", type=float, default=2.0,
+                   help="Focal Loss γ 参数（越大越聚焦难样本，默认 2.0）")
     p.add_argument("--extra_data_dirs", nargs="*", default=[],
                    help="额外训练数据目录列表（如 corrections/），追加到主数据集")
     p.add_argument("--amp",            action="store_true", default=True,
@@ -144,6 +335,21 @@ def get_args() -> argparse.Namespace:
                    default=0 if sys.platform == "win32" else 4,
                    help="DataLoader 工作进程数（Windows 建议 0）")
     p.add_argument("--seed",           type=int,   default=42)
+    # 增量 / 继续训练
+    p.add_argument("--resume", type=str, default="",
+                   help="加载已有权重：checkpoint 路径，或 auto（save_dir/best_model.pt）")
+    p.add_argument("--finetune", action="store_true",
+                   help="增量微调：自动 resume + 跳过阶段一，在已有模型上继续训练")
+    p.add_argument("--reuse_split", action="store_true", default=True,
+                   help="复用 save_dir 内已保存的数据划分（默认开启）")
+    p.add_argument("--no_reuse_split", dest="reuse_split", action="store_false",
+                   help="忽略已保存划分，按 seed 重新划分")
+    p.add_argument("--pretrained", action="store_true", default=True,
+                   help="从头训练时使用 ImageNet 预训练 Backbone（默认开启）")
+    p.add_argument("--no_pretrained", dest="pretrained", action="store_false",
+                   help="随机初始化 Backbone（仅建议在无 resume 时尝试）")
+    p.add_argument("--postprocess_only", action="store_true",
+                   help="跳过训练，仅加载 best_model.pt 做阈值校准与 ONNX 导出")
     return p.parse_args()
 
 
@@ -155,40 +361,52 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 class DefectDataset(torch.utils.data.Dataset):
     """
-    从一个或多个目录加载缺陷图像数据集。
-    支持同时传入 data/ 和 corrections/ 合并训练。
-    期望结构:
-        data_dir/
-            class_A/  *.jpg ...
-            class_B/  *.jpg ...
+    缺陷图像 Dataset：按「子文件夹名 = 类别名」组织的多源数据加载器。
+
+    支持 data/ 与 corrections/ 等多个根目录合并；
+    类别取各目录子文件夹名的并集，按字典序固定 idx（保证训练/推理 class_map 一致）。
+
+    目录结构示例:
+        data/
+            局部破损/  img001.jpg ...
+            断钻/      img002.jpg ...
     """
 
     def __init__(self, data_dirs, transform=None):
         """
-        data_dirs: Path / str / List[Path|str]
-          单个目录或目录列表，类别以子文件夹名称区分，多目录取类别并集。
+        Args:
+            data_dirs: 单个 Path/str 或列表；路径应为 normalize_training_paths 解析后的绝对路径。
+            transform: torchvision Compose；训练/验证集各用不同 transform 的 Subset。
         """
         self.transform = transform
         self.samples: List[Tuple[Path, int]] = []
         self.classes: List[str] = []
         self.class_to_idx: Dict[str, int] = {}
 
-        # 统一转为 Path 列表
+        # 统一转为绝对 Path 列表
         if isinstance(data_dirs, (str, Path)):
             data_dirs = [Path(data_dirs)]
         else:
             data_dirs = [Path(d) for d in data_dirs]
 
+        missing = [d for d in data_dirs if not d.is_dir()]
+        if missing:
+            raise FileNotFoundError(
+                "以下数据目录不存在或不是文件夹:\n"
+                + "\n".join(f"  · {d}" for d in missing)
+                + f"\n  项目根目录: {PROJECT_ROOT}"
+            )
+
         # 收集所有目录下的类别（取并集，字典序排序保证一致性）
         class_set: set = set()
         for d in data_dirs:
-            if d.exists():
-                class_set.update(
-                    sub.name for sub in d.iterdir() if sub.is_dir()
-                )
+            class_set.update(
+                sub.name for sub in d.iterdir() if sub.is_dir()
+            )
         if not class_set:
             raise RuntimeError(
-                f"在 {[str(d) for d in data_dirs]} 下未找到类别子文件夹。"
+                f"在 {[str(d) for d in data_dirs]} 下未找到类别子文件夹。\n"
+                f"期望结构: data/类别名/*.jpg"
             )
 
         self.classes      = sorted(class_set)
@@ -196,8 +414,6 @@ class DefectDataset(torch.utils.data.Dataset):
 
         # 遍历所有目录收集图像路径
         for d in data_dirs:
-            if not d.exists():
-                continue
             for cls_name in self.classes:
                 cls_dir = d / cls_name
                 if cls_dir.exists():
@@ -223,12 +439,15 @@ class DefectDataset(torch.utils.data.Dataset):
         return img, label
 
     def get_class_weights(self) -> torch.Tensor:
-        """计算反频率类别权重，用于不均衡数据集。"""
+        """
+        逆频率类别权重（第二层损失用）。
+        归一化使权重之和 = 类别数，避免整体 loss 尺度漂移。
+        """
         counts = torch.zeros(len(self.classes))
         for _, label in self.samples:
             counts[label] += 1
         weights = 1.0 / counts
-        return weights / weights.sum() * len(self.classes)   # 归一化
+        return weights / weights.sum() * len(self.classes)
 
 
 def get_transforms(img_size: int, pre_augmented: bool = True) -> Tuple[T.Compose, T.Compose]:
@@ -276,32 +495,38 @@ def get_transforms(img_size: int, pre_augmented: bool = True) -> Tuple[T.Compose
     return train_tf, val_tf
 
 
-def build_dataloaders(
-    data_dir: Path,
-    img_size: int,
+def _split_cache_path(save_dir: Path, seed: int) -> Path:
+    return save_dir / f"dataset_split_seed{seed}.json"
+
+
+def _load_or_create_split(
+    labels: List[int],
+    classes: List[str],
     val_ratio: float,
-    batch_size: int,
-    num_workers: int,
     seed: int,
-    extra_data_dirs: List[str] = None,
-    pre_augmented: bool = True,
-) -> Tuple[DataLoader, DataLoader, List[str], torch.Tensor]:
-    """构建 train/val DataLoader，分层划分；离线增强数据用 shuffle，原始数据用 WeightedRandomSampler。"""
+    save_dir: Optional[Path],
+    reuse_split: bool,
+) -> Tuple[List[int], List[int]]:
+    """
+    分层划分 train/val，并可选缓存到 save_dir/dataset_split_seed{seed}.json。
 
-    train_tf, val_tf = get_transforms(img_size, pre_augmented=pre_augmented)
+    增量训练时复用同一划分，保证验证集 F1 与历史 checkpoint 可比；
+    若样本数或类别列表变化，自动重新划分。
+    """
+    n_total = len(labels)
+    cache_path = _split_cache_path(save_dir, seed) if save_dir else None
 
-    # 合并主数据目录与额外数据目录（如 corrections/）
-    all_dirs = [data_dir]
-    if extra_data_dirs:
-        all_dirs += [Path(d) for d in extra_data_dirs if Path(d).exists()]
+    if cache_path and reuse_split and cache_path.is_file():
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if (
+            cached.get("n_samples") == n_total
+            and cached.get("classes") == classes
+        ):
+            print(f"  复用数据划分 → {cache_path.name}")
+            return cached["train_indices"], cached["val_indices"]
+        print("  数据集或类别已变化，重新划分 train/val")
 
-    # 先用无增强的数据集扫描全部文件，获取标签列表
-    full_dataset = DefectDataset(all_dirs, transform=None)
-    classes      = full_dataset.classes
-    n_total      = len(full_dataset)
-    labels       = [lbl for _, lbl in full_dataset.samples]
-
-    # 分层划分（按类别比例保留验证集）
     rng = np.random.default_rng(seed)
     train_indices, val_indices = [], []
     for cls_idx in range(len(classes)):
@@ -311,6 +536,59 @@ def build_dataloaders(
         val_indices.extend(cls_indices[:n_val].tolist())
         train_indices.extend(cls_indices[n_val:].tolist())
 
+    if cache_path:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "seed": seed,
+                    "n_samples": n_total,
+                    "classes": classes,
+                    "train_indices": train_indices,
+                    "val_indices": val_indices,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        print(f"  数据划分已缓存 → {cache_path.name}")
+
+    return train_indices, val_indices
+
+
+def build_dataloaders(
+    data_dir: Path,
+    img_size: int,
+    val_ratio: float,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    extra_data_dirs: List[Path] = None,
+    pre_augmented: bool = True,
+    save_dir: Optional[Path] = None,
+    reuse_split: bool = True,
+) -> Tuple[DataLoader, DataLoader, List[str], torch.Tensor]:
+    """
+    构建 train/val DataLoader（分层划分）。
+
+    第一层 · WeightedRandomSampler（--no_pre_augmented 时启用）:
+      训练时每个 batch 被强制采样为近似均衡分布，等效于将少数类过采样到与多数类相同频率。
+    离线已增强数据（默认）使用 shuffle，避免对同一增强图重复过采样；由第二～四层补偿不均衡。
+    """
+
+    train_tf, val_tf = get_transforms(img_size, pre_augmented=pre_augmented)
+
+    all_dirs = [data_dir]
+    if extra_data_dirs:
+        all_dirs += list(extra_data_dirs)
+
+    full_dataset = DefectDataset(all_dirs, transform=None)
+    classes      = full_dataset.classes
+    labels       = [lbl for _, lbl in full_dataset.samples]
+
+    train_indices, val_indices = _load_or_create_split(
+        labels, classes, val_ratio, seed, save_dir, reuse_split
+    )
+
     # 两份 Subset 各自用不同 transform
     train_set = Subset(DefectDataset(all_dirs, transform=train_tf), train_indices)
     val_set   = Subset(DefectDataset(all_dirs, transform=val_tf),   val_indices)
@@ -318,15 +596,16 @@ def build_dataloaders(
     train_labels = [labels[i] for i in train_indices]
     class_weights = full_dataset.get_class_weights()
 
-    # 离线已增强：shuffle 遍历全集 + 损失加权，避免对同一增强图过采样
-    # 原始数据：WeightedRandomSampler 平衡类别
+    # 第一层：原始数据 → WeightedRandomSampler；离线增强 → shuffle
     if pre_augmented:
+        sampler_mode = "shuffle（离线已增强，避免重复过采样同一张图）"
         train_loader = DataLoader(
             train_set, batch_size=batch_size, shuffle=True,
             num_workers=num_workers, pin_memory=True,
             persistent_workers=(num_workers > 0),
         )
     else:
+        sampler_mode = "WeightedRandomSampler（batch 类别均衡）"
         sample_weights = class_weights[torch.tensor(train_labels)].tolist()
         sampler = WeightedRandomSampler(
             weights=sample_weights,
@@ -349,6 +628,7 @@ def build_dataloaders(
         n_val_cls   = sum(1 for lbl in [labels[j] for j in val_indices] if lbl == i)
         print(f"    {cls:<20}  训练 {n_train_cls:>4}  验证 {n_val_cls:>3}")
     print(f"    {'合计':<20}  训练 {len(train_indices):>4}  验证 {len(val_indices):>3}")
+    print(f"    训练采样 : {sampler_mode}")
 
     return train_loader, val_loader, classes, class_weights
 
@@ -358,8 +638,12 @@ def build_dataloaders(
 # ═══════════════════════════════════════════════
 def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
     """
-    构建 EfficientNet-B0 模型，替换分类头为目标类别数。
-    若 torchvision 版本较旧，自动回退到 resnet18。
+    构建 EfficientNet-B0 + 自定义分类头。
+
+    · Dropout(0.4) 抑制小样本过拟合
+    · pretrained=True 时加载 ImageNet 权重（从头训练推荐）
+    · resume/finetune 时由 TrainingPipeline 设 pretrained=False，从 checkpoint 加载
+    · torchvision 过旧时回退 ResNet-18
     """
     try:
         weights = (models.EfficientNet_B0_Weights.IMAGENET1K_V1
@@ -384,7 +668,7 @@ def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
 
 
 def freeze_backbone(model: nn.Module):
-    """冻结 EfficientNet features（Backbone），仅开放 classifier。"""
+    """阶段一：冻结 features（Backbone），仅 classifier 参与反向传播。"""
     for name, param in model.named_parameters():
         if "classifier" not in name:
             param.requires_grad = False
@@ -400,6 +684,45 @@ def count_params(model: nn.Module) -> Tuple[int, int]:
     total    = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
+
+
+def load_checkpoint(
+    model: nn.Module,
+    ckpt_path: Path,
+    device: torch.device,
+    expected_classes: List[str],
+) -> Dict[str, Any]:
+    """
+    加载 checkpoint 做增量训练。类别数变化时 strict=False，仅复用 Backbone 权重。
+    """
+    print(f"\n  加载 Checkpoint → {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    state = ckpt.get("state_dict", ckpt)
+    ckpt_classes = ckpt.get("classes", [])
+
+    incompatible = model.load_state_dict(state, strict=False)
+    if incompatible.missing_keys:
+        print(f"  未加载（新参数）: {len(incompatible.missing_keys)} 项")
+    if incompatible.unexpected_keys:
+        print(f"  忽略（旧 checkpoint）: {len(incompatible.unexpected_keys)} 项")
+
+    if ckpt_classes and ckpt_classes != expected_classes:
+        print(f"  [注意] 类别列表变化:")
+        print(f"    checkpoint: {ckpt_classes}")
+        print(f"    当前数据: {expected_classes}")
+        print(f"    分类头已按当前类别数重新初始化，Backbone 权重已尽量复用。")
+    elif ckpt_classes:
+        print(f"  类别一致: {ckpt_classes}")
+
+    meta = {
+        "epoch": ckpt.get("epoch", 0),
+        "val_acc": ckpt.get("val_acc"),
+        "macro_f1": ckpt.get("macro_f1"),
+        "img_size": ckpt.get("img_size"),
+    }
+    if meta["macro_f1"] is not None:
+        print(f"  历史最佳 Macro-F1: {meta['macro_f1']:.4f}")
+    return meta
 
 
 # ═══════════════════════════════════════════════
@@ -427,6 +750,13 @@ def train_one_epoch(
     model, loader, criterion, optimizer, scaler, device,
     mixup_alpha: float = 0.0,
 ) -> Tuple[float, float]:
+    """
+    单 epoch 训练。返回 (平均 loss, 准确率)。
+
+    · AMP: scaler 非 None 时启用混合精度（仅 CUDA）
+    · MixUp: mixup_alpha>0 时混合样本与标签（缺陷分类默认关闭）
+    · 梯度裁剪 max_norm=1.0 防止小 batch 下梯度爆炸
+    """
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
@@ -468,15 +798,20 @@ def train_one_epoch(
 @torch.no_grad()
 def validate(
     model, loader, criterion, device
-) -> Tuple[float, float, np.ndarray, np.ndarray]:
+) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
+    """
+    验证一轮，返回 (loss, accuracy, macro_f1, all_preds, all_labels)。
+    macro_f1 为第四层指标，用于选取最优 checkpoint。
+    """
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
     all_preds, all_labels = [], []
 
     for imgs, labels in loader:
         imgs, labels = imgs.to(device), labels.to(device)
-        logits = model(imgs)
-        loss   = criterion(logits, labels)
+        with amp_autocast(enabled=False):
+            logits = model(imgs)
+            loss   = criterion(logits, labels)
         total_loss += loss.item() * imgs.size(0)
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
@@ -484,11 +819,16 @@ def validate(
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
+    all_preds  = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    macro_f1   = compute_macro_f1(all_preds, all_labels)
+
     return (
         total_loss / total,
         correct / total,
-        np.array(all_preds),
-        np.array(all_labels),
+        macro_f1,
+        all_preds,
+        all_labels,
     )
 
 
@@ -515,15 +855,18 @@ def plot_training_curves(history: dict, save_dir: Path):
     ax.legend()
     ax.grid(alpha=0.3)
 
-    # Accuracy
+    # Accuracy + Macro-F1
     ax = axes[1]
     ax.plot(history["train_acc"], label="训练准确率", linewidth=1.5)
     ax.plot(history["val_acc"],   label="验证准确率", linewidth=1.5)
+    if history.get("val_f1"):
+        ax.plot(history["val_f1"], label="验证 Macro-F1",
+                linewidth=1.8, linestyle="--", color="#E64A19")
     if "phase_split" in history:
         ax.axvline(history["phase_split"], color="gray", linestyle="--", linewidth=1)
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
-    ax.set_title("准确率")
+    ax.set_ylabel("Score")
+    ax.set_title("准确率 / Macro-F1（红虚线为选模型依据）")
     ax.legend()
     ax.grid(alpha=0.3)
 
@@ -575,38 +918,118 @@ def plot_confusion_matrix(
 # ═══════════════════════════════════════════════
 # 模型导出
 # ═══════════════════════════════════════════════
-def export_onnx(model: nn.Module, img_size: int, save_dir: Path, device) -> Path:
-    """导出 ONNX 模型，并用 ONNXRuntime 验证精度一致性。"""
+def export_onnx(model: nn.Module, img_size: int, save_dir: Path, device) -> Optional[Path]:
+    """
+    导出 ONNX 模型，并用 ONNXRuntime 验证精度一致性。
+    导出在 CPU 上进行，结束后将模型恢复到原 device（避免后续 GPU 推理 device 不一致）。
+    """
     if not HAS_ONNX:
         print("  [WARNING] onnx / onnxruntime 未安装，跳过 ONNX 导出。")
         return None
 
     model.eval()
-    dummy = torch.randn(1, 3, img_size, img_size, device=device)
+    orig_device = next(model.parameters()).device
+    cpu = torch.device("cpu")
     out_path = save_dir / "model.onnx"
+    dummy_cpu = torch.randn(1, 3, img_size, img_size, device=cpu)
 
-    torch.onnx.export(
-        model.cpu(),
-        dummy.cpu(),
-        str(out_path),
-        opset_version=12,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes={
-            "input":  {0: "batch_size"},
-            "output": {0: "batch_size"},
-        },
-    )
+    try:
+        model.to(cpu)
+        torch.onnx.export(
+            model,
+            dummy_cpu,
+            str(out_path),
+            opset_version=18,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={
+                "input":  {0: "batch_size"},
+                "output": {0: "batch_size"},
+            },
+        )
 
-    # 验证
-    ort_session = ort.InferenceSession(str(out_path))
-    ort_out = ort_session.run(None, {"input": dummy.cpu().numpy()})[0]
-    torch_out = model.cpu()(dummy.cpu()).detach().numpy()
-    max_diff = np.abs(ort_out - torch_out).max()
-    print(f"  ONNX 导出完成    → {out_path}")
-    print(f"    ORT vs Torch 最大误差: {max_diff:.2e}  {'✓' if max_diff < 1e-4 else '⚠'}")
+        ort_session = ort.InferenceSession(str(out_path))
+        ort_out = ort_session.run(
+            None, {"input": dummy_cpu.numpy()}
+        )[0]
+        torch_out = model(dummy_cpu).detach().numpy()
+        max_diff = float(np.abs(ort_out - torch_out).max())
+        print(f"  ONNX 导出完成    → {out_path}")
+        print(f"    ORT vs Torch 最大误差: {max_diff:.2e}  "
+              f"{'✓' if max_diff < 1e-4 else '⚠'}")
+        return out_path
+    except Exception as exc:
+        print(f"  [WARNING] ONNX 导出失败，已跳过: {exc}")
+        return None
+    finally:
+        model.to(orig_device)
+        model.eval()
 
-    return out_path
+
+def calibrate_thresholds(
+    model: nn.Module,
+    val_loader: DataLoader,
+    classes: List[str],
+    device,
+    save_dir: Path,
+) -> Dict[str, float]:
+    """
+    第四层 · 阈值校准（One-vs-Rest 逐类搜索）。
+
+    对每个类别 c，在验证集上扫描阈值 t∈[0.05, 0.95]，使「prob[c]≥t 判为 c」的 F1 最大。
+    推理引擎读取 class_thresholds.json 后，仅在 score≥阈值的类别中取 argmax，
+    可提升少数类（如「局部破损」）召回率，降低漏检。
+    """
+    model.eval()
+    model.to(device)
+    all_probs: List[np.ndarray] = []
+    all_labels: List[int] = []
+
+    with torch.no_grad():
+        for imgs, labels in val_loader:
+            imgs = imgs.to(device, non_blocking=True)
+            logits = model(imgs)
+            probs  = torch.softmax(logits, dim=1).cpu().numpy()
+            all_probs.append(probs)
+            all_labels.extend(labels.numpy().tolist())
+
+    probs_mat  = np.vstack(all_probs)
+    labels_arr = np.array(all_labels)
+
+    thresholds: Dict[str, float] = {}
+    print(f"\n  {'─'*58}")
+    print(f"  阈值校准（验证集，搜索步长 0.05）")
+    print(f"  {'─'*58}")
+    print(f"  {'类别':<12}  {'最优阈值':>8}  {'F1':>7}  {'Prec':>7}  {'Rec':>7}  n")
+
+    for idx, cls_name in enumerate(classes):
+        n_pos = int(np.sum(labels_arr == idx))
+        best_f1, best_thr = 0.0, 0.5
+        best_p, best_r = 0.0, 0.0
+
+        for thr in np.arange(0.05, 0.96, 0.05):
+            pred_bin  = (probs_mat[:, idx] >= thr).astype(int)
+            label_bin = (labels_arr == idx).astype(int)
+            tp  = int(np.sum((pred_bin == 1) & (label_bin == 1)))
+            fp  = int(np.sum((pred_bin == 1) & (label_bin == 0)))
+            fn  = int(np.sum((pred_bin == 0) & (label_bin == 1)))
+            pre = tp / (tp + fp + 1e-9)
+            rec = tp / (tp + fn + 1e-9)
+            f1  = 2 * pre * rec / (pre + rec + 1e-9)
+            if f1 > best_f1:
+                best_f1, best_thr = f1, float(thr)
+                best_p, best_r = pre, rec
+
+        thresholds[cls_name] = round(best_thr, 2)
+        print(f"  {cls_name:<12}  {best_thr:>8.2f}  "
+              f"{best_f1:>7.3f}  {best_p:>7.3f}  {best_r:>7.3f}  {n_pos}")
+
+    out = save_dir / "class_thresholds.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(thresholds, f, ensure_ascii=False, indent=2)
+    print(f"\n  阈值文件已保存  → {out}")
+    print(f"  （部署时可读取此文件，替代纯 argmax 以提升少数类召回）")
+    return thresholds
 
 
 def _ensure_utf8_console():
@@ -620,252 +1043,369 @@ def _ensure_utf8_console():
 
 
 # ═══════════════════════════════════════════════
-# 主训练流程
+# 训练 Pipeline（路径 / 数据 / 模型 / 训练 / 导出）
 # ═══════════════════════════════════════════════
-def main():
-    _ensure_utf8_console()
-    args    = get_args()
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data_dir = Path(args.data_dir)
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+class TrainingPipeline:
+    """
+    训练流水线：串联数据 → 模型 → 损失 → 两阶段训练 → 评估/导出。
 
-    # 随机种子
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    生命周期:
+        run()
+          ├─ setup_data()      构建 DataLoader、保存 class_map.json
+          ├─ setup_model()     构建网络、可选 load_checkpoint
+          ├─ setup_criterion() FocalLoss 或加权 CE + AMP Scaler
+          ├─ _train_phases()   阶段一（冻 Backbone）→ 阶段二（全量微调）
+          └─ finalize()        最佳权重评估、曲线/混淆矩阵、阈值校准、ONNX
 
-    print(f"\n{'═'*58}")
-    print(f"  缺陷分类模型训练")
-    print(f"{'═'*58}")
-    print(f"  设备     : {device}  "
-          + (f"({torch.cuda.get_device_name(0)})" if device.type == "cuda" else "(CPU 模式)"))
-    print(f"  图像尺寸 : {args.img_size} × {args.img_size}")
-    print(f"  批大小   : {args.batch_size}")
-    print(f"  阶段一   : {args.epochs_phase1} epochs  (lr={args.lr_phase1})")
-    print(f"  阶段二   : {args.epochs_phase2} epochs  (lr={args.lr_phase2})")
-    print(f"  MixUp α  : {args.mixup_alpha}")
-    print(f"  标签平滑 : {args.label_smooth}")
-    print(f"  离线增强 : {'是（轻量在线增强）' if args.pre_augmented else '否（完整在线增强）'}")
-    print(f"  损失加权 : {'是' if args.weighted_loss else '否'}")
+    postprocess_only 模式跳过 _train_phases，仅执行 finalize 中的后处理步骤。
+    """
 
-    # ── 数据 ──────────────────────────────────
-    train_loader, val_loader, classes, class_weights = build_dataloaders(
-        data_dir        = data_dir,
-        img_size        = args.img_size,
-        val_ratio       = args.val_ratio,
-        batch_size      = args.batch_size,
-        num_workers     = args.num_workers,
-        seed            = args.seed,
-        extra_data_dirs = args.extra_data_dirs,
-        pre_augmented   = args.pre_augmented,
-    )
-    num_classes = len(classes)
-    print(f"\n  类别({num_classes})  : {classes}")
+    def __init__(self, args: argparse.Namespace):
+        """args 应已通过 normalize_training_paths 解析为绝对 Path。"""
+        self.args = args
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.data_dir: Path = args.data_dir
+        self.save_dir: Path = args.save_dir
+        self.classes: List[str] = []
+        self.class_weights: Optional[torch.Tensor] = None
+        self.train_loader: Optional[DataLoader] = None
+        self.val_loader: Optional[DataLoader] = None
+        self.model: Optional[nn.Module] = None
+        self.criterion: Optional[nn.Module] = None
+        self.scaler = None
+        self.history: Dict[str, Any] = {}
+        self.best_macro_f1 = 0.0
+        self.no_improve = 0
+        self.best_ckpt_path = self.save_dir / "best_model.pt"
+        self.resume_meta: Dict[str, Any] = {}
 
-    # 打印类别样本分布，便于确认不均衡程度
-    all_dirs = [data_dir] + [Path(d) for d in args.extra_data_dirs if Path(d).exists()]
-    full_scan = DefectDataset(all_dirs, transform=None)
-    print(f"  样本总数 : {len(full_scan)}")
-    for cls in classes:
-        idx = full_scan.class_to_idx[cls]
-        n = sum(1 for _, lbl in full_scan.samples if lbl == idx)
-        print(f"    {cls:<12} {n:>5}  ({n/len(full_scan)*100:.1f}%)")
+    def run(self) -> None:
+        self._set_seed()
+        self._print_banner()
+        self.setup_data()
+        self.setup_model()
+        if self.args.postprocess_only:
+            if not self.best_ckpt_path.is_file():
+                raise FileNotFoundError(
+                    f"--postprocess_only 需要已有权重: {self.best_ckpt_path}"
+                )
+            if self.resume_meta.get("macro_f1") is not None:
+                self.best_macro_f1 = float(self.resume_meta["macro_f1"])
+            print(f"\n  [--postprocess_only] 跳过训练，仅后处理")
+            self.setup_criterion()
+            self.finalize()
+            return
+        self.setup_criterion()
+        self._train_phases()
+        self.finalize()
 
-    # 保存类别映射（供 PyQt 应用加载）
-    cls_map = {"classes": classes, "class_to_idx": {c: i for i, c in enumerate(classes)}}
-    with open(save_dir / "class_map.json", "w", encoding="utf-8") as f:
-        json.dump(cls_map, f, ensure_ascii=False, indent=2)
+    def _set_seed(self) -> None:
+        torch.manual_seed(self.args.seed)
+        np.random.seed(self.args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.args.seed)
 
-    # ── 模型 ──────────────────────────────────
-    print(f"\n  预训练  : ImageNet-1K")
-    model = build_model(num_classes, pretrained=True).to(device)
+    def _print_banner(self) -> None:
+        a = self.args
+        print(f"\n{'═'*58}")
+        print(f"  缺陷分类模型训练")
+        print(f"{'═'*58}")
+        print(f"  项目根   : {PROJECT_ROOT}")
+        print(f"  工作目录 : {os.getcwd()}")
+        print(f"  数据目录 : {self.data_dir}")
+        print(f"  输出目录 : {self.save_dir}")
+        print(f"  设备     : {self.device}  "
+              + (f"({torch.cuda.get_device_name(0)})"
+                 if self.device.type == "cuda" else "(CPU 模式)"))
+        print(f"  图像尺寸 : {a.img_size} × {a.img_size}")
+        print(f"  批大小   : {a.batch_size}")
+        print(f"  阶段一   : {a.epochs_phase1} epochs  (lr={a.lr_phase1})")
+        print(f"  阶段二   : {a.epochs_phase2} epochs  (lr={a.lr_phase2})")
+        mode = "增量微调" if a.resume_path else "从头训练"
+        print(f"  训练模式 : {mode}"
+              + (f"  ← {a.resume_path.name}" if a.resume_path else ""))
+        print(f"  MixUp α  : {a.mixup_alpha}")
+        print(f"  离线增强 : {'是' if a.pre_augmented else '否（+ Sampler）'}")
+        print(f"  类别权重 : {'是' if a.use_class_weight else '否'}")
+        print(f"  Focal    : {'是 γ=' + str(a.focal_gamma) if a.use_focal_loss else '否'}")
+        print(f"  选模指标 : val_macro_f1")
 
-    # ── 损失 ──────────────────────────────────
-    loss_weight = class_weights.to(device) if args.weighted_loss else None
-    criterion = nn.CrossEntropyLoss(
-        weight=loss_weight,
-        label_smoothing=args.label_smooth,
-    )
+    def setup_data(self) -> None:
+        a = self.args
+        self.train_loader, self.val_loader, self.classes, self.class_weights = (
+            build_dataloaders(
+                data_dir=self.data_dir,
+                img_size=a.img_size,
+                val_ratio=a.val_ratio,
+                batch_size=a.batch_size,
+                num_workers=a.num_workers,
+                seed=a.seed,
+                extra_data_dirs=a.extra_data_dirs,
+                pre_augmented=a.pre_augmented,
+                save_dir=self.save_dir,
+                reuse_split=a.reuse_split,
+            )
+        )
+        print(f"\n  类别({len(self.classes)})  : {self.classes}")
 
-    # AMP Scaler（仅 CUDA）
-    use_amp = args.amp and (device.type == "cuda")
-    scaler  = create_grad_scaler(use_amp)
-    if use_amp:
-        print(f"  混合精度: 启用 (AMP)")
+        all_dirs = [self.data_dir] + list(a.extra_data_dirs)
+        full_scan = DefectDataset(all_dirs, transform=None)
+        print(f"  样本总数 : {len(full_scan)}")
+        for cls in self.classes:
+            idx = full_scan.class_to_idx[cls]
+            n = sum(1 for _, lbl in full_scan.samples if lbl == idx)
+            print(f"    {cls:<12} {n:>5}  ({n/len(full_scan)*100:.1f}%)")
 
-    # ── 训练历史 ──────────────────────────────
-    history = {
-        "train_loss": [], "val_loss": [],
-        "train_acc":  [], "val_acc":  [],
-        "phase_split": args.epochs_phase1,
-    }
+        print(f"\n  类别权重（逆频，损失第二层）:")
+        for cls, w in zip(self.classes, self.class_weights.tolist()):
+            bar = "█" * max(1, int(w * 8))
+            print(f"    {cls:<12}  {w:>6.3f}  {bar}")
 
-    best_val_acc  = 0.0
-    no_improve    = 0
-    best_ckpt_path = save_dir / "best_model.pt"
+        cls_map = {
+            "classes": self.classes,
+            "class_to_idx": {c: i for i, c in enumerate(self.classes)},
+        }
+        with open(self.save_dir / "class_map.json", "w", encoding="utf-8") as f:
+            json.dump(cls_map, f, ensure_ascii=False, indent=2)
 
-    def _run_epoch(epoch, total_epochs, phase_label):
-        """执行单轮训练+验证，打印日志，更新历史。"""
-        nonlocal best_val_acc, no_improve
+    def setup_model(self) -> None:
+        """构建模型；若 args.resume_path 存在则加载权重做增量训练。"""
+        a = self.args
+        use_pretrained = a.pretrained and (a.resume_path is None)
+        if a.resume_path and a.pretrained:
+            print(f"\n  Backbone: 从 checkpoint 加载（忽略 ImageNet 预训练）")
+        elif use_pretrained:
+            print(f"\n  Backbone: ImageNet-1K 预训练")
+        else:
+            print(f"\n  Backbone: 随机初始化")
 
+        self.model = build_model(
+            len(self.classes), pretrained=use_pretrained
+        ).to(self.device)
+
+        if a.resume_path:
+            self.resume_meta = load_checkpoint(
+                self.model, a.resume_path, self.device, self.classes
+            )
+            if a.resume_path == self.best_ckpt_path and a.resume_meta.get("macro_f1"):
+                self.best_macro_f1 = float(a.resume_meta["macro_f1"])
+
+    def setup_criterion(self) -> None:
+        a = self.args
+        cw = self.class_weights.to(self.device) if a.use_class_weight else None
+        if a.use_focal_loss:
+            self.criterion = FocalLoss(gamma=a.focal_gamma, weight=cw)
+            print(f"  损失函数 : FocalLoss(γ={a.focal_gamma})"
+                  + (" + 类别权重" if cw is not None else ""))
+        else:
+            self.criterion = nn.CrossEntropyLoss(
+                weight=cw, label_smoothing=a.label_smooth,
+            )
+            print(f"  损失函数 : CrossEntropy(平滑={a.label_smooth})"
+                  + (" + 类别权重" if cw is not None else ""))
+
+        use_amp = a.amp and (self.device.type == "cuda")
+        self.scaler = create_grad_scaler(use_amp)
+        if use_amp:
+            print(f"  混合精度: 启用 (AMP)")
+
+        self.history = {
+            "train_loss": [], "val_loss": [],
+            "train_acc": [], "val_acc": [],
+            "val_f1": [], "phase_split": a.epochs_phase1,
+        }
+
+    def _run_epoch(
+        self, epoch: int, total_epochs: int, phase_label: str,
+        optimizer, scheduler,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        a = self.args
         t0 = time.time()
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, scaler, device,
-            mixup_alpha=args.mixup_alpha,
+            self.model, self.train_loader, self.criterion,
+            optimizer, self.scaler, self.device,
+            mixup_alpha=a.mixup_alpha,
         )
-        val_loss, val_acc, val_preds, val_labels = validate(
-            model, val_loader, criterion, device,
+        val_loss, val_acc, macro_f1, val_preds, val_labels = validate(
+            self.model, self.val_loader, self.criterion, self.device,
         )
         elapsed = time.time() - t0
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["train_acc"].append(train_acc)
-        history["val_acc"].append(val_acc)
+        self.history["train_loss"].append(train_loss)
+        self.history["val_loss"].append(val_loss)
+        self.history["train_acc"].append(train_acc)
+        self.history["val_acc"].append(val_acc)
+        self.history["val_f1"].append(macro_f1)
 
-        improved = val_acc > best_val_acc
+        improved = macro_f1 > self.best_macro_f1
         if improved:
-            best_val_acc = val_acc
+            self.best_macro_f1 = macro_f1
             torch.save(
                 {
-                    "epoch":      epoch,
-                    "state_dict": model.state_dict(),
-                    "val_acc":    val_acc,
-                    "classes":    classes,
-                    "img_size":   args.img_size,
+                    "epoch": epoch,
+                    "state_dict": self.model.state_dict(),
+                    "val_acc": val_acc,
+                    "macro_f1": macro_f1,
+                    "classes": self.classes,
+                    "img_size": a.img_size,
                 },
-                best_ckpt_path,
+                self.best_ckpt_path,
             )
-            no_improve = 0
+            self.no_improve = 0
         else:
-            no_improve += 1
+            self.no_improve += 1
 
         marker = "★" if improved else " "
         print(
             f"  [{phase_label}] Ep {epoch:>3}/{total_epochs}  "
             f"loss {train_loss:.4f}/{val_loss:.4f}  "
             f"acc {train_acc:.3f}/{val_acc:.3f}  "
-            f"{elapsed:.1f}s  {marker}"
+            f"F1 {macro_f1:.3f}  {elapsed:.1f}s  {marker}"
         )
         scheduler.step()
         return val_preds, val_labels
 
-    # ════════════════════════════════════
-    # 阶段一：冻结 Backbone，训练分类头
-    # ════════════════════════════════════
-    if args.epochs_phase1 > 0:
-        print(f"\n{'─'*58}")
-        print(f"  阶段一：冻结 Backbone，训练分类头  ({args.epochs_phase1} epochs)")
-        print(f"{'─'*58}")
+    def _train_phases(self) -> None:
+        """
+        两阶段训练 + Early Stopping（patience 轮 val_macro_f1 无提升则停止）。
 
-        freeze_backbone(model)
-        total, trainable = count_params(model)
-        print(f"  参数量: 总计={total:,}  可训练={trainable:,}  "
-              f"({trainable/total*100:.1f}%)")
+        阶段二 Head 学习率为 Backbone 的 5 倍，使分类头更快适应新数据。
+        """
+        a = self.args
+        if a.epochs_phase1 > 0:
+            print(f"\n{'─'*58}")
+            print(f"  阶段一：冻结 Backbone  ({a.epochs_phase1} epochs)")
+            print(f"{'─'*58}")
+            freeze_backbone(self.model)
+            total, trainable = count_params(self.model)
+            print(f"  可训练参数: {trainable:,} / {total:,}")
 
-        optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=args.lr_phase1, weight_decay=1e-4,
-        )
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs_phase1, eta_min=args.lr_phase1 * 0.1,
-        )
-
-        for ep in range(1, args.epochs_phase1 + 1):
-            _run_epoch(ep, args.epochs_phase1, "P1")
-            if no_improve >= args.patience:
-                print(f"  Early stopping at epoch {ep}（{args.patience} 轮无改善）")
-                break
-
-        no_improve = 0   # 重置，阶段二单独计算
-
-    # ════════════════════════════════════
-    # 阶段二：解冻全部，端到端微调
-    # ════════════════════════════════════
-    if args.epochs_phase2 > 0:
-        print(f"\n{'─'*58}")
-        print(f"  阶段二：解冻全部层，端到端微调  ({args.epochs_phase2} epochs)")
-        print(f"{'─'*58}")
-
-        unfreeze_all(model)
-        total, trainable = count_params(model)
-        print(f"  参数量: 总计={total:,}  可训练={trainable:,}  (100%)")
-
-        # 对 Backbone 和 Head 使用不同学习率
-        backbone_params = [p for n, p in model.named_parameters()
-                           if "classifier" not in n]
-        head_params     = [p for n, p in model.named_parameters()
-                           if "classifier" in n]
-        optimizer = optim.AdamW(
-            [
-                {"params": backbone_params, "lr": args.lr_phase2},
-                {"params": head_params,     "lr": args.lr_phase2 * 5},
-            ],
-            weight_decay=1e-4,
-        )
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs_phase2, eta_min=args.lr_phase2 * 0.05,
-        )
-
-        offset = args.epochs_phase1 if args.epochs_phase1 > 0 else 0
-        last_preds = last_labels = None
-
-        for ep in range(1, args.epochs_phase2 + 1):
-            last_preds, last_labels = _run_epoch(
-                offset + ep, offset + args.epochs_phase2, "P2"
+            optimizer = optim.AdamW(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=a.lr_phase1, weight_decay=1e-4,
             )
-            if no_improve >= args.patience:
-                print(f"  Early stopping at epoch {offset+ep}（{args.patience} 轮无改善）")
-                break
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=a.epochs_phase1, eta_min=a.lr_phase1 * 0.1,
+            )
+            for ep in range(1, a.epochs_phase1 + 1):
+                self._run_epoch(ep, a.epochs_phase1, "P1", optimizer, scheduler)
+                if self.no_improve >= a.patience:
+                    print(f"  Early stopping @ epoch {ep}")
+                    break
+            self.no_improve = 0
 
-    # ════════════════════════════════════
-    # 训练结束，评估与导出
-    # ════════════════════════════════════
-    print(f"\n{'═'*58}")
-    print(f"  最佳验证准确率 : {best_val_acc:.4f}")
-    print(f"  模型已保存     → {best_ckpt_path}")
-    print(f"{'═'*58}")
+        if a.epochs_phase2 > 0:
+            print(f"\n{'─'*58}")
+            print(f"  阶段二：端到端微调  ({a.epochs_phase2} epochs)")
+            print(f"{'─'*58}")
+            unfreeze_all(self.model)
+            total, trainable = count_params(self.model)
+            print(f"  可训练参数: {trainable:,} / {total:,}")
 
-    # 加载最佳权重进行最终评估
-    ckpt = torch.load(best_ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["state_dict"])
+            backbone_params = [
+                p for n, p in self.model.named_parameters() if "classifier" not in n
+            ]
+            head_params = [
+                p for n, p in self.model.named_parameters() if "classifier" in n
+            ]
+            optimizer = optim.AdamW(
+                [
+                    {"params": backbone_params, "lr": a.lr_phase2},
+                    {"params": head_params, "lr": a.lr_phase2 * 5},
+                ],
+                weight_decay=1e-4,
+            )
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=a.epochs_phase2, eta_min=a.lr_phase2 * 0.05,
+            )
+            offset = a.epochs_phase1 if a.epochs_phase1 > 0 else 0
+            for ep in range(1, a.epochs_phase2 + 1):
+                self._run_epoch(
+                    offset + ep, offset + a.epochs_phase2, "P2",
+                    optimizer, scheduler,
+                )
+                if self.no_improve >= a.patience:
+                    print(f"  Early stopping @ epoch {offset + ep}")
+                    break
 
-    _, final_acc, final_preds, final_labels = validate(
-        model, val_loader, criterion, device
-    )
-    print(f"  最终验证准确率 : {final_acc:.4f}")
+    def finalize(self) -> None:
+        """
+        训练收尾：加载 best_model.pt → 报告 → 可视化 → 阈值校准 → ONNX → train_config.json。
 
-    if HAS_SKLEARN:
-        print("\n" + classification_report(
-            final_labels, final_preds,
-            target_names=classes, digits=4,
-            zero_division=0,
-        ))
+        顺序说明: 阈值校准在 GPU 上跑验证集；ONNX 导出会临时将模型移到 CPU，
+        export_onnx 的 finally 块会恢复原 device。
+        """
+        a = self.args
+        if not self.best_ckpt_path.is_file():
+            print("\n  [警告] 未产生 best_model.pt，跳过评估与导出。")
+            return
 
-    # 可视化
-    plot_training_curves(history, save_dir)
-    plot_confusion_matrix(final_preds, final_labels, classes, save_dir)
+        print(f"\n{'═'*58}")
+        print(f"  最佳 Macro-F1  : {self.best_macro_f1:.4f}")
+        print(f"  模型已保存     → {self.best_ckpt_path}")
+        print(f"{'═'*58}")
 
-    # ONNX 导出（将模型移到 CPU 以便通用部署）
-    print(f"\n{'─'*58}")
-    print("  模型导出")
-    print(f"{'─'*58}")
-    export_onnx(model, args.img_size, save_dir, device)
+        ckpt = torch.load(self.best_ckpt_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["state_dict"])
+        _, final_acc, final_f1, final_preds, final_labels = validate(
+            self.model, self.val_loader, self.criterion, self.device,
+        )
+        print(f"  最终验证准确率 : {final_acc:.4f}")
+        print(f"  最终 Macro-F1  : {final_f1:.4f}")
 
-    # 保存训练配置（供再训练和 PyQt 应用读取）
-    train_cfg = {
-        "img_size":      args.img_size,
-        "num_classes":   num_classes,
-        "classes":       classes,
-        "best_val_acc":  round(best_val_acc, 6),
-        "model_arch":    "efficientnet_b0",
-    }
-    with open(save_dir / "train_config.json", "w", encoding="utf-8") as f:
-        json.dump(train_cfg, f, ensure_ascii=False, indent=2)
-    print(f"  训练配置已保存  → {save_dir / 'train_config.json'}")
-    print(f"\n  全部完成 ✓\n")
+        if HAS_SKLEARN:
+            print("\n" + classification_report(
+                final_labels, final_preds,
+                target_names=self.classes, digits=4, zero_division=0,
+            ))
+
+        plot_training_curves(self.history, self.save_dir)
+        plot_confusion_matrix(
+            final_preds, final_labels, self.classes, self.save_dir,
+        )
+
+        # 阈值校准需在 GPU 上跑验证集；放在 ONNX 导出之前，避免 export 临时切到 CPU
+        print(f"\n{'─'*58}\n  阈值校准\n{'─'*58}")
+        self.model.to(self.device)
+        calibrate_thresholds(
+            self.model, self.val_loader, self.classes,
+            self.device, self.save_dir,
+        )
+
+        print(f"\n{'─'*58}\n  模型导出\n{'─'*58}")
+        export_onnx(self.model, a.img_size, self.save_dir, self.device)
+
+        train_cfg = {
+            "project_root":   str(PROJECT_ROOT),
+            "data_dir":       str(self.data_dir),
+            "img_size":       a.img_size,
+            "num_classes":    len(self.classes),
+            "classes":        self.classes,
+            "best_val_acc":   round(final_acc, 6),
+            "best_macro_f1":  round(final_f1, 6),
+            "model_arch":     "efficientnet_b0",
+            "use_focal_loss": a.use_focal_loss,
+            "use_class_weight": a.use_class_weight,
+            "focal_gamma":    a.focal_gamma,
+            "resumed_from":   str(a.resume_path) if a.resume_path else None,
+        }
+        with open(self.save_dir / "train_config.json", "w", encoding="utf-8") as f:
+            json.dump(train_cfg, f, ensure_ascii=False, indent=2)
+        print(f"  训练配置已保存  → {self.save_dir / 'train_config.json'}")
+        print(f"\n  全部完成 ✓\n")
+
+
+def main():
+    """入口：解析参数 → 规范化路径 → 运行 TrainingPipeline。"""
+    _ensure_utf8_console()
+    try:
+        args = normalize_training_paths(get_args())
+        TrainingPipeline(args).run()
+    except FileNotFoundError as e:
+        print(f"\n[错误] {e}\n", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

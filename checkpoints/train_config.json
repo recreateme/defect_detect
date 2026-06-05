@@ -1,4 +1,6 @@
 {
+  "project_root": "D:\\工作记录\\3 人工智能相关课题\\张旭\\defects_classify",
+  "data_dir": "D:\\工作记录\\3 人工智能相关课题\\张旭\\defects_classify\\data",
   "img_size": 128,
   "num_classes": 5,
   "classes": [
@@ -8,6 +10,11 @@
     "点朝上",
     "面朝上"
   ],
-  "best_val_acc": 0.95155,
-  "model_arch": "efficientnet_b0"
+  "best_val_acc": 0.949612,
+  "best_macro_f1": 0.901655,
+  "model_arch": "efficientnet_b0",
+  "use_focal_loss": true,
+  "use_class_weight": true,
+  "focal_gamma": 2.0,
+  "resumed_from": null
 }

@@ -29,7 +29,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 # 常量 & 配置
 # ═══════════════════════════════════════════════════════════
-APP_NAME = "缺陷图像分类系统"
+APP_NAME = "钻石缺陷图像分类系统"
 APP_VER  = "v1.0"
 CFG_FILE = Path("app_config.json")
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -44,6 +44,9 @@ DEFAULT_CFG: Dict = {
     "conf_threshold":  0.5,
 }
 
+# 模型再训练 / 设置页解除只读所需密码
+ADMIN_PAGE_PASSWORD = "20250508"
+
 # ── QSS ──────────────────────────────────────────────────
 STYLE = """
 * { font-family: 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', sans-serif; }
@@ -52,7 +55,7 @@ QMainWindow, QDialog { background: #F0F2F5; }
 QWidget#sidebar  { background: #1E2D40; }
 QPushButton#nav  {
     color:#7F98AE; background:transparent; text-align:left;
-    padding:13px 14px 13px 20px; border:none; font-size:13px; border-radius:0;
+    padding:14px 14px 14px 18px; border:none; font-size:15px; border-radius:0;
 }
 QPushButton#nav:hover    { background:#253449; color:#B0C4D8; }
 QPushButton#nav[sel=true]{
@@ -149,6 +152,66 @@ class AppState:
         )
         self.results: List[Dict] = []
         self.config:  Dict       = _load_cfg()
+        self.admin_unlocked: bool = False
+
+
+def _verify_admin_password(parent: QWidget) -> bool:
+    """弹出密码框，验证通过返回 True。"""
+    text, ok = QInputDialog.getText(
+        parent,
+        "管理员验证",
+        "模型再训练与设置页面已锁定，请输入密码以解除只读：",
+        QLineEdit.Password,
+    )
+    if not ok:
+        return False
+    if text != ADMIN_PAGE_PASSWORD:
+        QMessageBox.warning(parent, "验证失败", "密码错误，仍保持只读模式。")
+        return False
+    return True
+
+
+class AdminLockBar(QFrame):
+    """只读模式提示条 + 解锁 / 重新锁定。"""
+
+    unlock_requested = pyqtSignal()
+    lock_requested   = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8)
+        self.lbl = QLabel()
+        self.lbl.setWordWrap(True)
+        lay.addWidget(self.lbl, 1)
+
+        self.btn_unlock = _mk_btn("输入密码解锁", "warning")
+        self.btn_unlock.clicked.connect(self.unlock_requested.emit)
+        lay.addWidget(self.btn_unlock)
+
+        self.btn_lock = _mk_btn("重新锁定", "flat", 96)
+        self.btn_lock.clicked.connect(self.lock_requested.emit)
+        lay.addWidget(self.btn_lock)
+
+        self.set_locked(True)
+
+    def set_locked(self, locked: bool) -> None:
+        if locked:
+            self.setStyleSheet(
+                "AdminLockBar{background:#FFF3E0;border:1px solid #FFB74D;border-radius:6px;}"
+            )
+            self.lbl.setText("🔒 只读模式：不可修改训练参数或系统配置，如需操作请输入管理员密码。")
+            self.lbl.setStyleSheet("color:#E65100;font-size:12px;")
+            self.btn_unlock.setVisible(True)
+            self.btn_lock.setVisible(False)
+        else:
+            self.setStyleSheet(
+                "AdminLockBar{background:#E8F5E9;border:1px solid #81C784;border-radius:6px;}"
+            )
+            self.lbl.setText("🔓 已解除只读：可修改训练参数与系统设置。")
+            self.lbl.setStyleSheet("color:#2E7D32;font-size:12px;")
+            self.btn_unlock.setVisible(False)
+            self.btn_lock.setVisible(True)
 
 
 def _load_cfg() -> Dict:
@@ -298,15 +361,267 @@ class ImageDropZone(QLabel):
         return self._img_path
 
 
-def _thumb(path: str, size: int = 64) -> QLabel:
-    """返回带缩略图的 QLabel（用于 setCellWidget）。"""
-    lbl = QLabel()
-    lbl.setAlignment(Qt.AlignCenter)
-    px  = QPixmap(path)
-    if not px.isNull():
-        px = px.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    lbl.setPixmap(px)
-    return lbl
+def _thumb(path: str, size: int = 64) -> "ThumbnailLabel":
+    """返回可悬停预览、单击打开的缩略图控件。"""
+    return ThumbnailLabel(path, size)
+
+
+def _open_image(path: str) -> None:
+    """用系统默认程序打开图像文件。"""
+    p = Path(path)
+    if p.is_file():
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
+
+
+class ThumbnailLabel(QLabel):
+    """缩略图：悬停右侧预览，单击打开原图文件。"""
+
+    preview_hover = pyqtSignal(str)
+    preview_leave = pyqtSignal()
+    clicked_path  = pyqtSignal(str)
+
+    def __init__(self, path: str, size: int = 64, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._size = size
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("悬停预览 · 单击打开原图")
+        px = QPixmap(path)
+        if not px.isNull():
+            px = px.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.setPixmap(px)
+
+    def enterEvent(self, event):
+        if self._path and Path(self._path).is_file():
+            self.preview_hover.emit(self._path)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.preview_leave.emit()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._path:
+            self.clicked_path.emit(self._path)
+        super().mousePressEvent(event)
+
+
+class HoverFilenameLabel(QLabel):
+    """文件名列：悬停预览，单击固定右侧预览。"""
+
+    preview_hover = pyqtSignal(str)
+    preview_leave = pyqtSignal()
+    pin_requested = pyqtSignal(str)
+
+    def __init__(self, path: str, text: str, parent=None):
+        super().__init__(text, parent)
+        self._path = path
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("悬停预览 · 单击固定右侧预览")
+
+    def enterEvent(self, event):
+        if self._path and Path(self._path).is_file():
+            self.preview_hover.emit(self._path)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.preview_leave.emit()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._path:
+            self.pin_requested.emit(self._path)
+        super().mousePressEvent(event)
+
+
+class SidePreviewController(QObject):
+    """
+    右侧预览控制器：悬停临时显示；鼠标离开后若已固定则恢复固定图，否则清空。
+    """
+
+    def __init__(self, preview: "ImagePreviewSidePanel"):
+        super().__init__(preview)
+        self.preview = preview
+        self.pinned_path: Optional[str] = None
+        self.pinned_meta: str = ""
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(300)
+        self._timer.timeout.connect(self._on_hide_timeout)
+
+    def show_transient(self, path: str, meta: str = "") -> None:
+        self._timer.stop()
+        self.preview.show_image(path, meta)
+
+    def pin(self, path: str, meta: str = "") -> None:
+        self._timer.stop()
+        self.pinned_path = path
+        self.pinned_meta = meta
+        self.preview.set_pinned(True)
+        self.preview.show_image(path, meta)
+
+    def unpin(self) -> None:
+        self.pinned_path = None
+        self.pinned_meta = ""
+        self.preview.set_pinned(False)
+        self.preview.clear_preview()
+
+    def schedule_hide(self) -> None:
+        self._timer.start()
+
+    def cancel_hide(self) -> None:
+        self._timer.stop()
+
+    def _on_hide_timeout(self) -> None:
+        if self.pinned_path and Path(self.pinned_path).is_file():
+            self.preview.show_image(self.pinned_path, self.pinned_meta)
+            self.preview.set_pinned(True)
+        else:
+            self.preview.clear_preview()
+
+
+class ImagePreviewSidePanel(QFrame):
+    """表格右侧原图预览区。"""
+
+    def __init__(self, min_size: int = 300, parent=None):
+        super().__init__(parent)
+        self.setObjectName("card")
+        self.setFixedWidth(min_size + 24)
+        self._current_path = ""
+        self._controller: Optional[SidePreviewController] = None
+        self._min_size = min_size
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        hdr = QHBoxLayout()
+        self.title_lbl = QLabel("原图预览")
+        self.title_lbl.setStyleSheet("font-size:13px;font-weight:bold;color:#455A64;")
+        hdr.addWidget(self.title_lbl)
+        hdr.addStretch()
+        self.pin_lbl = QLabel("")
+        self.pin_lbl.setStyleSheet("color:#1976D2;font-size:11px;font-weight:bold;")
+        hdr.addWidget(self.pin_lbl)
+        lay.addLayout(hdr)
+
+        self.image_lbl = QLabel("悬停缩略图或文件名\n查看原图")
+        self.image_lbl.setAlignment(Qt.AlignCenter)
+        self.image_lbl.setMinimumSize(min_size, min_size)
+        self.image_lbl.setStyleSheet(
+            "background:#FAFAFA;border:1px dashed #CFD8DC;border-radius:6px;"
+            "color:#90A4AE;font-size:13px;"
+        )
+        self.image_lbl.setWordWrap(True)
+        lay.addWidget(self.image_lbl)
+
+        self.path_lbl = QLabel("")
+        self.path_lbl.setStyleSheet("color:#37474F;font-size:12px;font-weight:bold;")
+        self.path_lbl.setWordWrap(True)
+        self.path_lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.path_lbl)
+
+        self.meta_lbl = QLabel("")
+        self.meta_lbl.setStyleSheet("color:#78909C;font-size:11px;")
+        self.meta_lbl.setWordWrap(True)
+        self.meta_lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.meta_lbl)
+
+        btn_open = _mk_btn("打开原图", "primary")
+        btn_open.clicked.connect(self._open_current)
+        lay.addWidget(btn_open)
+
+        btn_unpin = _mk_btn("取消固定", "flat")
+        btn_unpin.clicked.connect(self._request_unpin)
+        lay.addWidget(btn_unpin)
+        lay.addStretch()
+
+    def bind_controller(self, controller: SidePreviewController) -> None:
+        self._controller = controller
+
+    def set_pinned(self, pinned: bool) -> None:
+        self.pin_lbl.setText("已固定" if pinned else "")
+
+    def enterEvent(self, event):
+        if self._controller:
+            self._controller.cancel_hide()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._controller:
+            self._controller.schedule_hide()
+        super().leaveEvent(event)
+
+    def show_image(self, path: str, meta: str = "") -> None:
+        self._current_path = path
+        px = QPixmap(path)
+        if px.isNull():
+            self.image_lbl.setText("无法加载图像")
+            self.path_lbl.setText(Path(path).name)
+            self.meta_lbl.setText(path)
+            return
+        side = self._min_size - 8
+        scaled = px.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.image_lbl.setPixmap(scaled)
+        self.image_lbl.setStyleSheet(
+            "background:#1A1A2E;border:1px solid #37474F;border-radius:6px;"
+        )
+        self.path_lbl.setText(Path(path).name)
+        self.meta_lbl.setText(meta or f"尺寸 {px.width()}×{px.height()} px")
+
+    def clear_preview(self) -> None:
+        self._current_path = ""
+        self.image_lbl.clear()
+        self.image_lbl.setText("悬停缩略图或文件名\n查看原图")
+        self.image_lbl.setStyleSheet(
+            "background:#FAFAFA;border:1px dashed #CFD8DC;border-radius:6px;"
+            "color:#90A4AE;font-size:13px;"
+        )
+        self.path_lbl.setText("")
+        self.meta_lbl.setText("")
+        self.set_pinned(False)
+
+    def _open_current(self) -> None:
+        if self._current_path and Path(self._current_path).is_file():
+            _open_image(self._current_path)
+
+    def _request_unpin(self) -> None:
+        if self._controller:
+            self._controller.unpin()
+
+
+# 兼容旧引用
+PreviewHoverController = SidePreviewController
+ImagePreviewBar = ImagePreviewSidePanel
+
+
+def _connect_thumb_preview(
+    thumb: ThumbnailLabel,
+    controller: SidePreviewController,
+    meta: str = "",
+) -> None:
+    """缩略图悬停预览；单击打开系统默认看图程序。"""
+    thumb.preview_hover.connect(
+        lambda p, m=meta: controller.show_transient(p, m)
+    )
+    thumb.preview_leave.connect(controller.schedule_hide)
+    thumb.clicked_path.connect(_open_image)
+
+
+def _connect_filename_preview(
+    label: HoverFilenameLabel,
+    controller: SidePreviewController,
+    meta: str = "",
+) -> None:
+    """文件名悬停预览；单击固定右侧预览。"""
+    label.preview_hover.connect(
+        lambda p, m=meta: controller.show_transient(p, m)
+    )
+    label.preview_leave.connect(controller.schedule_hide)
+    label.pin_requested.connect(
+        lambda p, m=meta: controller.pin(p, m)
+    )
 
 
 def _mk_btn(text: str, cls: str = "flat", width: int = 0) -> QPushButton:
@@ -634,11 +949,20 @@ class ResultsPage(QWidget):
         self.filter_conf.setRange(0.0, 1.0)
         self.filter_conf.setSingleStep(0.05)
         self.filter_conf.setValue(0.0)
-        self.filter_conf.setFixedWidth(75)
+        self.filter_conf.setFixedWidth(150)
         self.filter_conf.valueChanged.connect(self._apply_filter)
         toolbar.addWidget(self.filter_conf)
 
         toolbar.addStretch()
+
+        self._all_checked = True
+        self.btn_toggle_sel = _mk_btn("全不选", "flat", 88)
+        self.btn_toggle_sel.clicked.connect(self._toggle_all_checks)
+        toolbar.addWidget(self.btn_toggle_sel)
+
+        btn_flag_sel = _mk_btn("标记选中项", "warning")
+        btn_flag_sel.clicked.connect(self._flag_selected)
+        toolbar.addWidget(btn_flag_sel)
 
         btn_flag_all = _mk_btn("全部标记为待修正", "warning")
         btn_flag_all.clicked.connect(self._flag_visible)
@@ -650,22 +974,33 @@ class ResultsPage(QWidget):
 
         root.addLayout(toolbar)
 
-        # 结果表
-        self.table = QTableWidget(0, 6)
+        content = QHBoxLayout()
+        content.setSpacing(12)
+
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["缩略图", "文件名", "预测类别", "置信度", "修正类别", "操作"]
+            ["", "缩略图", "文件名", "预测类别", "置信度", "修正类别", "操作"]
         )
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.setColumnWidth(0, 72)
-        self.table.setColumnWidth(2, 120)
-        self.table.setColumnWidth(3, 80)
-        self.table.setColumnWidth(4, 130)
-        self.table.setColumnWidth(5, 90)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 36)
+        self.table.setColumnWidth(1, 72)
+        self.table.setColumnWidth(3, 120)
+        self.table.setColumnWidth(4, 80)
+        self.table.setColumnWidth(5, 130)
+        self.table.setColumnWidth(6, 90)
         self.table.setRowHeight(0, 72)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
-        root.addWidget(self.table)
+        self.table.itemChanged.connect(self._on_check_changed)
+        content.addWidget(self.table, 1)
+
+        self.preview = ImagePreviewSidePanel(min_size=300)
+        self._preview_ctrl = SidePreviewController(self.preview)
+        self.preview.bind_controller(self._preview_ctrl)
+        content.addWidget(self.preview)
+
+        root.addLayout(content, 1)
 
         # 底部状态
         self.lbl_bottom = QLabel("")
@@ -687,6 +1022,9 @@ class ResultsPage(QWidget):
 
         self._fill_table(results)
 
+    def _meta_for_result(self, r: Dict) -> str:
+        return f"预测：{r['class']}  ·  {r['confidence']*100:.1f}%"
+
     def _fill_table(self, results: List[Dict]):
         cls_f  = self.filter_cls.currentText()
         conf_f = self.filter_conf.value()
@@ -704,37 +1042,51 @@ class ResultsPage(QWidget):
             self.table.setRowHeight(row, 72)
             idx = self.state.results.index(r)   # 原始索引
 
-            # 缩略图
-            if Path(r["path"]).exists():
-                self.table.setCellWidget(row, 0, _thumb(r["path"], 62))
+            # 勾选框
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            chk.setCheckState(Qt.Checked if r.get("_checked", True) else Qt.Unchecked)
+            chk.setData(Qt.UserRole, idx)
+            chk.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 0, chk)
 
-            # 文件名
-            fn = QTableWidgetItem(Path(r["path"]).name)
-            fn.setData(Qt.UserRole, idx)
-            self.table.setItem(row, 1, fn)
+            # 缩略图：悬停预览，单击打开原图
+            meta = self._meta_for_result(r)
+            if Path(r["path"]).exists():
+                thumb = _thumb(r["path"], 62)
+                _connect_thumb_preview(thumb, self._preview_ctrl, meta)
+                self.table.setCellWidget(row, 1, thumb)
+
+            # 文件名：悬停预览，单击固定右侧预览
+            fn_w = HoverFilenameLabel(r["path"], Path(r["path"]).name)
+            fn_w.setStyleSheet(
+                "font-size:13px;color:#263238;padding:2px 4px;"
+            )
+            _connect_filename_preview(fn_w, self._preview_ctrl, meta)
+            self.table.setCellWidget(row, 2, fn_w)
 
             # 预测类别（带颜色标记）
             cls_item = QTableWidgetItem(r["class"])
             cls_item.setTextAlignment(Qt.AlignCenter)
             if r.get("flagged"):
                 cls_item.setForeground(QColor("#C62828"))
-            self.table.setItem(row, 2, cls_item)
+            self.table.setItem(row, 3, cls_item)
 
             # 置信度
             conf_item = QTableWidgetItem(f"{r['confidence']*100:.1f}%")
             conf_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 3, conf_item)
+            self.table.setItem(row, 4, conf_item)
 
             # 修正类别（可编辑下拉）
             combo = QComboBox()
-            combo.addItem("—（未修正）")
+            combo.addItem("未修正")
             for c in self.state.engine.classes if self.state.engine else []:
                 combo.addItem(c)
             true_cls = r.get("true_class", "")
             if true_cls and true_cls in (self.state.engine.classes if self.state.engine else []):
                 combo.setCurrentText(true_cls)
             combo.currentTextChanged.connect(lambda txt, i=idx: self._set_true_class(i, txt))
-            self.table.setCellWidget(row, 4, combo)
+            self.table.setCellWidget(row, 5, combo)
 
             # 操作按钮
             btn = QPushButton("🚩 标记" if not r.get("flagged") else "✓ 已标记")
@@ -744,15 +1096,67 @@ class ResultsPage(QWidget):
                 "background:#388E3C;color:white;border:none;border-radius:4px;padding:4px 8px;"
             )
             btn.clicked.connect(lambda _, i=idx: self._toggle_flag(i))
-            self.table.setCellWidget(row, 5, btn)
+            self.table.setCellWidget(row, 6, btn)
 
         n_flagged = sum(1 for r in results if r.get("flagged"))
         self.lbl_stat.setText(f"共 {len(results)} 条")
         self.lbl_bottom.setText(
             f"显示 {len(filtered)} 条  |  已标记待修正 {n_flagged} 条"
         )
+        if self._preview_ctrl.pinned_path:
+            p = self._preview_ctrl.pinned_path
+            for r in results:
+                if r["path"] == p:
+                    self.preview.show_image(p, self._meta_for_result(r))
+                    self.preview.set_pinned(True)
+                    break
+
+    def _on_check_changed(self, item: QTableWidgetItem):
+        if item.column() != 0:
+            return
+        idx = item.data(Qt.UserRole)
+        if idx is not None and 0 <= idx < len(self.state.results):
+            self.state.results[idx]["_checked"] = (
+                item.checkState() == Qt.Checked
+            )
 
     def _apply_filter(self):
+        self._sync_checks_from_table()
+        self._fill_table(self.state.results)
+
+    def _sync_checks_from_table(self):
+        """将表格勾选状态写回 results，避免刷新后丢失。"""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if not item:
+                continue
+            idx = item.data(Qt.UserRole)
+            if idx is not None and 0 <= idx < len(self.state.results):
+                self.state.results[idx]["_checked"] = (
+                    item.checkState() == Qt.Checked
+                )
+
+    def _toggle_all_checks(self):
+        self._all_checked = not self._all_checked
+        self._set_all_checks(self._all_checked)
+
+    def _set_all_checks(self, checked: bool):
+        self._all_checked = checked
+        self.btn_toggle_sel.setText("全不选" if checked else "全选")
+        state = Qt.Checked if checked else Qt.Unchecked
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(state)
+                idx = item.data(Qt.UserRole)
+                if idx is not None and 0 <= idx < len(self.state.results):
+                    self.state.results[idx]["_checked"] = checked
+
+    def _flag_selected(self):
+        self._sync_checks_from_table()
+        for r in self.state.results:
+            if r.get("_checked", False):
+                r["flagged"] = True
         self._fill_table(self.state.results)
 
     def _set_true_class(self, idx: int, text: str):
@@ -762,10 +1166,12 @@ class ResultsPage(QWidget):
 
     def _toggle_flag(self, idx: int):
         if 0 <= idx < len(self.state.results):
+            self._sync_checks_from_table()
             self.state.results[idx]["flagged"] = not self.state.results[idx]["flagged"]
             self._fill_table(self.state.results)
 
     def _flag_visible(self):
+        self._sync_checks_from_table()
         cls_f  = self.filter_cls.currentText()
         conf_f = self.filter_conf.value()
         for r in self.state.results:
@@ -816,19 +1222,29 @@ class CorrectionPage(QWidget):
         self.lbl_count = QLabel("待修正：0 项")
         self.lbl_count.setStyleSheet("color:#E65100;font-weight:bold;")
         hdr.addWidget(self.lbl_count)
-        btn_save_all = _mk_btn("保存全部修正", "success")
+
+        btn_sel_all = _mk_btn("全不选", "flat", 88)
+        btn_sel_all.clicked.connect(self._toggle_all_checks)
+        hdr.addWidget(btn_sel_all)
+        self.btn_toggle_sel = btn_sel_all
+        self._all_checked = True
+
+        btn_save_all = _mk_btn("保存选中修正", "success")
         btn_save_all.clicked.connect(self._save_all)
         hdr.addWidget(btn_save_all)
         root.addLayout(hdr)
 
         lbl_hint = QLabel(
-            '为下方每项图像选择正确的类别，然后点击「保存全部修正」将数据归档至 corrections/ 目录。'
+            '勾选需要归档的条目，选择正确类别后点击「保存选中修正」。'
+            '悬停缩略图或文件名在右侧预览；单击文件名固定预览，单击缩略图打开原图。'
         )
         lbl_hint.setStyleSheet("color:#546E7A;font-size:12px;")
         lbl_hint.setWordWrap(True)
         root.addWidget(lbl_hint)
 
-        # 滚动区域
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         self.card_container = QWidget()
@@ -837,10 +1253,31 @@ class CorrectionPage(QWidget):
         self.card_lay.setContentsMargins(0, 0, 0, 0)
         self.card_lay.addStretch()
         scroll.setWidget(self.card_container)
-        root.addWidget(scroll)
+        body.addWidget(scroll, 1)
+
+        self.preview = ImagePreviewSidePanel(min_size=280)
+        self._preview_ctrl = SidePreviewController(self.preview)
+        self.preview.bind_controller(self._preview_ctrl)
+        body.addWidget(self.preview)
+
+        root.addLayout(body, 1)
+
+        self._card_checks: List[QCheckBox] = []
+
+    def _toggle_all_checks(self):
+        self._all_checked = not self._all_checked
+        self._set_all_checks(self._all_checked)
+
+    def _set_all_checks(self, checked: bool):
+        self._all_checked = checked
+        self.btn_toggle_sel.setText("全不选" if checked else "全选")
+        for cb in self._card_checks:
+            cb.setChecked(checked)
 
     def refresh(self):
         """刷新已标记待修正的条目。"""
+        self._card_checks.clear()
+        self.preview.clear_preview()
         # 清空旧卡片
         while self.card_lay.count() > 1:
             it = self.card_lay.takeAt(0)
@@ -859,33 +1296,42 @@ class CorrectionPage(QWidget):
     def _make_card(self, orig_idx: int, r: Dict, classes: List[str]) -> QFrame:
         card = QFrame()
         card.setObjectName("card")
-        card.setFixedHeight(96)
+        card.setFixedHeight(100)
         cl = QHBoxLayout(card)
         cl.setContentsMargins(12, 8, 12, 8)
-        cl.setSpacing(14)
+        cl.setSpacing(12)
 
-        # 缩略图
-        thumb_lbl = QLabel()
-        thumb_lbl.setFixedSize(72, 72)
-        thumb_lbl.setAlignment(Qt.AlignCenter)
-        if Path(r["path"]).exists():
-            px = QPixmap(r["path"]).scaled(70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            thumb_lbl.setPixmap(px)
+        chk = QCheckBox()
+        chk.setChecked(True)
+        chk.setProperty("orig_idx", orig_idx)
+        chk.setToolTip("勾选后参与「保存选中修正」")
+        self._card_checks.append(chk)
+        cl.addWidget(chk)
+
+        # 缩略图：悬停预览，单击打开原图
+        meta = f"预测：{r['class']}  ·  {r['confidence']*100:.1f}%"
+        thumb_lbl = ThumbnailLabel(r["path"], 72) if Path(r["path"]).exists() else QLabel()
+        if isinstance(thumb_lbl, ThumbnailLabel):
+            _connect_thumb_preview(thumb_lbl, self._preview_ctrl, meta)
+        else:
+            thumb_lbl.setFixedSize(72, 72)
         cl.addWidget(thumb_lbl)
 
         # 文件信息
         info = QVBoxLayout()
         info.setSpacing(4)
-        fn_lbl = QLabel(Path(r["path"]).name)
-        fn_lbl.setStyleSheet("font-weight:bold;color:#37474F;font-size:12px;")
-        fn_lbl.setMaximumWidth(200)
-        fn_lbl.setWordWrap(False)
+        fn_lbl = HoverFilenameLabel(r["path"], Path(r["path"]).name)
+        fn_lbl.setStyleSheet(
+            "font-weight:bold;color:#263238;font-size:15px;padding:2px 0;"
+        )
+        fn_lbl.setMinimumWidth(220)
+        fn_lbl.setWordWrap(True)
+        _connect_filename_preview(fn_lbl, self._preview_ctrl, meta)
         pred_lbl = QLabel(f"预测：{r['class']}  ({r['confidence']*100:.1f}%)")
-        pred_lbl.setStyleSheet("color:#C62828;font-size:12px;")
+        pred_lbl.setStyleSheet("color:#C62828;font-size:13px;")
         info.addWidget(fn_lbl)
         info.addWidget(pred_lbl)
-        cl.addLayout(info)
-        cl.addStretch()
+        cl.addLayout(info, 1)
 
         # 正确类别下拉
         combo = QComboBox()
@@ -910,15 +1356,28 @@ class CorrectionPage(QWidget):
         status.setFixedWidth(60)
         cl.addWidget(status)
 
+        card.setProperty("orig_idx", orig_idx)
+        card.setProperty("result_ref", r)
         return card
 
     def _save_all(self):
-        """将所有已标记且有正确类别的条目保存到 corrections/ 目录。"""
+        """将勾选且已设置正确类别的条目保存到 corrections/ 目录。"""
         corrections_dir = Path(self.state.config.get("corrections_dir", "corrections"))
         saved, skipped  = 0, 0
 
-        for r in self.state.results:
+        checked_indices = {
+            cb.property("orig_idx")
+            for cb in self._card_checks
+            if cb.isChecked() and cb.property("orig_idx") is not None
+        }
+        if not checked_indices:
+            QMessageBox.warning(self, "提示", "请先勾选需要保存的条目。")
+            return
+
+        for i, r in enumerate(self.state.results):
             if not r.get("flagged"):
+                continue
+            if i not in checked_indices:
                 continue
             true_cls = r.get("true_class", "").strip()
             if not true_cls:
@@ -955,12 +1414,16 @@ class CorrectionPage(QWidget):
 # ═══════════════════════════════════════════════════════════
 class RetrainPage(QWidget):
     model_updated = pyqtSignal()
+    admin_unlock_requested = pyqtSignal()
+    admin_lock_requested   = pyqtSignal()
 
     def __init__(self, state: AppState):
         super().__init__()
         self.state  = state
         self.worker: Optional[TrainWorker] = None
+        self._admin_locked = True
         self._build()
+        self.set_admin_locked(True)
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -970,6 +1433,11 @@ class RetrainPage(QWidget):
         title = QLabel("模型再训练")
         title.setStyleSheet("font-size:18px;font-weight:bold;color:#263238;")
         root.addWidget(title)
+
+        self.lock_bar = AdminLockBar()
+        self.lock_bar.unlock_requested.connect(self.admin_unlock_requested.emit)
+        self.lock_bar.lock_requested.connect(self.admin_lock_requested.emit)
+        root.addWidget(self.lock_bar)
 
         # ── 数据统计 ──────────────────────────────
         stat_grp = QGroupBox("数据统计")
@@ -981,6 +1449,7 @@ class RetrainPage(QWidget):
         btn_refresh = _mk_btn("刷新统计", "flat")
         btn_refresh.clicked.connect(self._refresh_stats)
         stat_lay.addWidget(btn_refresh)
+        self.btn_refresh = btn_refresh
         root.addWidget(stat_grp)
 
         # ── 训练参数 ──────────────────────────────
@@ -1045,6 +1514,19 @@ class RetrainPage(QWidget):
         root.addLayout(btn_row)
         root.addStretch()
 
+    def set_admin_locked(self, locked: bool) -> None:
+        """切换只读 / 可编辑（默认只读）。"""
+        self._admin_locked = locked
+        self.lock_bar.set_locked(locked)
+        for w in (self.sp_img, self.sp_ep1, self.sp_ep2, self.sp_bs,
+                  self.btn_train, self.btn_stop, self.btn_apply):
+            w.setEnabled(not locked)
+        # 刷新统计为只读操作，锁定状态下仍允许查看
+        self.btn_refresh.setEnabled(True)
+        if locked and self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.btn_stop.setEnabled(False)
+
     def _refresh_stats(self):
         data_dir  = Path(self.state.config.get("data_dir", "data"))
         corr_dir  = Path(self.state.config.get("corrections_dir", "corrections"))
@@ -1069,12 +1551,15 @@ class RetrainPage(QWidget):
         # 尝试从 train_config.json 读取上次训练参数
         cfg_path = Path(self.state.config.get("pt_path", "checkpoints/best_model.pt")
                         ).parent / "train_config.json"
-        if cfg_path.exists():
-            with open(cfg_path) as f:
+        if cfg_path.exists() and not self._admin_locked:
+            with open(cfg_path, encoding="utf-8") as f:
                 tc = json.load(f)
             self.sp_img.setValue(tc.get("img_size", 224))
 
     def _start_train(self):
+        if self._admin_locked:
+            QMessageBox.warning(self, "只读模式", "请先输入密码解除只读后再训练。")
+            return
         if not TRAIN_SCRIPT.exists():
             QMessageBox.critical(self, "错误", f"训练脚本不存在：{TRAIN_SCRIPT}")
             return
@@ -1120,6 +1605,9 @@ class RetrainPage(QWidget):
         self.log_edit.setTextColor(QColor(color))
 
     def _apply_model(self):
+        if self._admin_locked:
+            QMessageBox.warning(self, "只读模式", "请先输入密码解除只读后再应用模型。")
+            return
         if not (self.state.engine):
             return
         try:
@@ -1147,11 +1635,16 @@ class RetrainPage(QWidget):
 # ═══════════════════════════════════════════════════════════
 class SettingsPage(QWidget):
     settings_saved = pyqtSignal(str)   # emits status message
+    admin_unlock_requested = pyqtSignal()
+    admin_lock_requested   = pyqtSignal()
 
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
+        self._admin_locked = True
+        self._browse_btns: List[QPushButton] = []
         self._build()
+        self.set_admin_locked(True)
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -1162,29 +1655,36 @@ class SettingsPage(QWidget):
         title.setStyleSheet("font-size:18px;font-weight:bold;color:#263238;")
         root.addWidget(title)
 
+        self.lock_bar = AdminLockBar()
+        self.lock_bar.unlock_requested.connect(self.admin_unlock_requested.emit)
+        self.lock_bar.lock_requested.connect(self.admin_lock_requested.emit)
+        root.addWidget(self.lock_bar)
+
         # ── 模型文件 ──────────────────────────────
         model_grp = QGroupBox("模型文件")
         mfl = QFormLayout(model_grp)
         mfl.setLabelAlignment(Qt.AlignRight)
 
         self.pt_edit = QLineEdit(self.state.config.get("pt_path", ""))
-        btn_pt = _mk_btn("…", "flat", 30)
+        btn_pt = _mk_btn("选择文件 …", "flat", 96)
         btn_pt.clicked.connect(
             lambda: self._browse_file(self.pt_edit, "PyTorch 模型", "*.pt *.pth")
         )
         pt_row = QHBoxLayout()
         pt_row.addWidget(self.pt_edit)
         pt_row.addWidget(btn_pt)
+        self._browse_btns.append(btn_pt)
         mfl.addRow("PyTorch 模型 (.pt):", pt_row)
 
         self.onnx_edit = QLineEdit(self.state.config.get("onnx_path", ""))
-        btn_onnx = _mk_btn("…", "flat", 30)
+        btn_onnx = _mk_btn("选择文件 …", "flat", 96)
         btn_onnx.clicked.connect(
             lambda: self._browse_file(self.onnx_edit, "ONNX 模型", "*.onnx")
         )
         onnx_row = QHBoxLayout()
         onnx_row.addWidget(self.onnx_edit)
         onnx_row.addWidget(btn_onnx)
+        self._browse_btns.append(btn_onnx)
         mfl.addRow("ONNX 模型 (.onnx):", onnx_row)
 
         root.addWidget(model_grp)
@@ -1195,23 +1695,25 @@ class SettingsPage(QWidget):
         dfl.setLabelAlignment(Qt.AlignRight)
 
         self.data_edit = QLineEdit(self.state.config.get("data_dir", "data"))
-        btn_data = _mk_btn("…", "flat", 30)
+        btn_data = _mk_btn("选择路径 …", "flat", 96)
         btn_data.clicked.connect(
             lambda: self._browse_dir(self.data_edit, "训练数据目录")
         )
         data_row = QHBoxLayout()
         data_row.addWidget(self.data_edit)
         data_row.addWidget(btn_data)
+        self._browse_btns.append(btn_data)
         dfl.addRow("训练数据目录:", data_row)
 
         self.corr_edit = QLineEdit(self.state.config.get("corrections_dir", "corrections"))
-        btn_corr = _mk_btn("…", "flat", 30)
+        btn_corr = _mk_btn("选择路径 …", "flat", 96)
         btn_corr.clicked.connect(
             lambda: self._browse_dir(self.corr_edit, "修正数据目录")
         )
         corr_row = QHBoxLayout()
         corr_row.addWidget(self.corr_edit)
         corr_row.addWidget(btn_corr)
+        self._browse_btns.append(btn_corr)
         dfl.addRow("修正数据目录:", corr_row)
 
         root.addWidget(data_grp)
@@ -1238,19 +1740,39 @@ class SettingsPage(QWidget):
         btn_save = _mk_btn("保存并加载模型", "primary")
         btn_save.setFixedHeight(40)
         btn_save.clicked.connect(self._save_and_load)
+        self.btn_save = btn_save
         root.addWidget(btn_save)
 
+    def set_admin_locked(self, locked: bool) -> None:
+        """切换只读 / 可编辑（默认只读）。"""
+        self._admin_locked = locked
+        self.lock_bar.set_locked(locked)
+        for edit in (self.pt_edit, self.onnx_edit, self.data_edit, self.corr_edit):
+            edit.setReadOnly(locked)
+        for btn in self._browse_btns:
+            btn.setEnabled(not locked)
+        self.chk_gpu.setEnabled(not locked)
+        self.sp_conf.setEnabled(not locked)
+        self.btn_save.setEnabled(not locked)
+
     def _browse_file(self, edit: QLineEdit, title: str, flt: str):
+        if self._admin_locked:
+            return
         path, _ = QFileDialog.getOpenFileName(self, title, "", flt)
         if path:
             edit.setText(path)
 
     def _browse_dir(self, edit: QLineEdit, title: str):
+        if self._admin_locked:
+            return
         path = QFileDialog.getExistingDirectory(self, title)
         if path:
             edit.setText(path)
 
     def _save_and_load(self):
+        if self._admin_locked:
+            QMessageBox.warning(self, "只读模式", "请先输入密码解除只读后再保存设置。")
+            return
         cfg = {
             "pt_path":         self.pt_edit.text().strip(),
             "onnx_path":       self.onnx_edit.text().strip(),
@@ -1285,8 +1807,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.state = AppState()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(980, 680)
-        self.resize(1100, 740)
+        self.setMinimumSize(1200, 800)
+        self.resize(1440, 920)
         self._build_ui()
         self._auto_load_model()
 
@@ -1301,7 +1823,7 @@ class MainWindow(QMainWindow):
         # ── 侧边栏 ────────────────────────────────
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(168)
+        sidebar.setFixedWidth(186)
         sb_lay = QVBoxLayout(sidebar)
         sb_lay.setContentsMargins(0, 0, 0, 0)
         sb_lay.setSpacing(0)
@@ -1358,6 +1880,10 @@ class MainWindow(QMainWindow):
         self.p_correct.saved_signal.connect(self._on_correction_saved)
         self.p_retrain.model_updated.connect(self._on_model_updated)
         self.p_settings.settings_saved.connect(self._update_status)
+        self.p_retrain.admin_unlock_requested.connect(self._try_unlock_admin_pages)
+        self.p_settings.admin_unlock_requested.connect(self._try_unlock_admin_pages)
+        self.p_retrain.admin_lock_requested.connect(self._lock_admin_pages)
+        self.p_settings.admin_lock_requested.connect(self._lock_admin_pages)
 
         # ── 状态栏 ────────────────────────────────
         self._lbl_model  = QLabel("模型：未加载")
@@ -1381,6 +1907,23 @@ class MainWindow(QMainWindow):
         # 进入结果页时刷新
         if idx == 1:
             self.p_results.refresh()
+
+    def _try_unlock_admin_pages(self):
+        if self.state.admin_unlocked:
+            return
+        if _verify_admin_password(self):
+            self.state.admin_unlocked = True
+            self.p_retrain.set_admin_locked(False)
+            self.p_settings.set_admin_locked(False)
+            QMessageBox.information(
+                self, "已解锁",
+                "模型再训练与设置页面已解除只读，可进行修改。"
+            )
+
+    def _lock_admin_pages(self):
+        self.state.admin_unlocked = False
+        self.p_retrain.set_admin_locked(True)
+        self.p_settings.set_admin_locked(True)
 
     def _on_new_results(self, results: List[Dict]):
         n = len(results)

@@ -40,6 +40,7 @@ class InferenceEngine:
         self.loaded: bool = False
         self._pt_path: Optional[str] = None
         self._onnx_path: Optional[str] = None
+        self.class_thresholds: Optional[Dict[str, float]] = None
 
     # ──────────────────────────────────────────────────
     # 加载
@@ -73,6 +74,7 @@ class InferenceEngine:
 
         # ── 读取类别信息 ─────────────────────────────
         self.classes, self.img_size = self._read_meta(pt_path, onnx_path)
+        self.class_thresholds = self._read_class_thresholds(pt_path, onnx_path)
 
         # ── 加载权重 ─────────────────────────────────
         if backend == "onnx":
@@ -153,7 +155,7 @@ class InferenceEngine:
             logits  = self.model(tensor)
             scores  = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
-        pred_idx = int(np.argmax(scores))
+        pred_idx = self._decide_class(scores)
         elapsed  = (time.perf_counter() - t0) * 1000
 
         return {
@@ -235,6 +237,35 @@ class InferenceEngine:
                 "请确保 class_map.json 或 train_config.json 与模型文件在同一目录。"
             )
         return classes, img_size
+
+    def _read_class_thresholds(
+        self,
+        pt_path: Optional[str],
+        onnx_path: Optional[str],
+    ) -> Optional[Dict[str, float]]:
+        """读取 train.py 生成的 class_thresholds.json（可选）。"""
+        for base in filter(None, [pt_path, onnx_path]):
+            thr_path = Path(base).parent / "class_thresholds.json"
+            if thr_path.exists():
+                with open(thr_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        return None
+
+    def _decide_class(self, scores: np.ndarray) -> int:
+        """
+        有 per-class 阈值时：仅在 score >= 阈值的类别中取最高分；
+        否则回退 argmax。
+        """
+        if not self.class_thresholds:
+            return int(np.argmax(scores))
+        thr = np.array([
+            self.class_thresholds.get(c, 0.5) for c in self.classes
+        ], dtype=np.float32)
+        mask = scores >= thr
+        if mask.any():
+            candidates = np.where(mask)[0]
+            return int(candidates[np.argmax(scores[candidates])])
+        return int(np.argmax(scores))
 
     @staticmethod
     def _build_model(num_classes: int) -> nn.Module:
