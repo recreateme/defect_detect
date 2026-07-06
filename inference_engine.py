@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-推理引擎
-支持双后端：
-  · PyTorch  —— GPU 优先，自动检测 CUDA
-  · ONNXRuntime —— CPU 优化，需安装 onnxruntime
+开发环境推理引擎 — PyTorch GPU 优先，ONNX CPU 回退。
+
+性能要点：
+  · PyTorch 路径：GPU 上批量 forward，减少 kernel 启动次数
+  · ONNX 回退：与机台版共用 inference_common.run_batch_predict
+  · torch.inference_mode() 关闭 autograd，避免 .numpy() 报错
 """
 
-import json
+from __future__ import annotations
+
+import os
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -19,51 +23,70 @@ import torchvision.models as models
 import torchvision.transforms as T
 from PIL import Image
 
+from inference_common import (
+    build_threshold_vector,
+    logits_row_to_result,
+    make_error_result,
+    read_class_thresholds,
+    read_model_meta,
+    run_batch_predict,
+)
+
 try:
     import onnxruntime as ort
     HAS_ORT = True
 except ImportError:
     HAS_ORT = False
+    ort = None  # type: ignore
+
+_DEFAULT_BATCH_GPU = 32
+_DEFAULT_BATCH_CPU = 8
+
+
+def _load_pt_meta(pt_path: Optional[str]) -> Tuple[List[str], int]:
+    if pt_path and Path(pt_path).exists():
+        ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
+        return ckpt.get("classes", []), int(ckpt.get("img_size", 224))
+    return [], 224
+
+
+def _ort_session_options():
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.intra_op_num_threads = max(1, (os.cpu_count() or 4) // 2)
+    opts.inter_op_num_threads = 1
+    return opts
 
 
 class InferenceEngine:
-    """图像缺陷分类推理引擎（单例友好，可热更新模型）"""
+    """图像缺陷分类推理引擎（开发版，支持热更新与批量推理）。"""
 
     def __init__(self):
         self.model: Optional[nn.Module] = None
         self.ort_session = None
         self.classes: List[str] = []
-        self.img_size: int = 224
+        self.img_size: int = 128
         self.device: str = "cpu"
-        self.backend: str = "none"      # "pytorch" | "onnx"
+        self.backend: str = "none"
         self.transform: Optional[T.Compose] = None
         self.loaded: bool = False
         self._pt_path: Optional[str] = None
         self._onnx_path: Optional[str] = None
         self.class_thresholds: Optional[Dict[str, float]] = None
+        self._thr_vec: Optional[np.ndarray] = None
+        self._input_name: str = "input"
+        self._batch_size: int = _DEFAULT_BATCH_CPU
 
-    # ──────────────────────────────────────────────────
-    # 加载
-    # ──────────────────────────────────────────────────
     def load(
         self,
         pt_path: Optional[str],
         onnx_path: Optional[str] = None,
         use_gpu: bool = True,
     ) -> str:
-        """
-        加载模型，返回状态描述字符串。
-        选择策略:
-          1. use_gpu=True 且 CUDA 可用 → PyTorch GPU
-          2. onnx_path 存在 且 onnxruntime 已安装 → ONNX CPU
-          3. 兜底 → PyTorch CPU
-        """
         self.loaded = False
 
         gpu_ok = use_gpu and torch.cuda.is_available()
-        onnx_ok = (
-            onnx_path and Path(onnx_path).exists() and HAS_ORT
-        )
+        onnx_ok = bool(onnx_path and Path(onnx_path).exists() and HAS_ORT)
 
         if gpu_ok:
             target_device, backend = "cuda", "pytorch"
@@ -72,37 +95,44 @@ class InferenceEngine:
         else:
             target_device, backend = "cpu", "pytorch"
 
-        # ── 读取类别信息 ─────────────────────────────
-        self.classes, self.img_size = self._read_meta(pt_path, onnx_path)
-        self.class_thresholds = self._read_class_thresholds(pt_path, onnx_path)
+        self.classes, self.img_size = read_model_meta(
+            pt_path, onnx_path, load_pt_meta=_load_pt_meta,
+        )
+        self.class_thresholds = read_class_thresholds(pt_path, onnx_path)
+        self._thr_vec = build_threshold_vector(self.classes, self.class_thresholds)
 
-        # ── 加载权重 ─────────────────────────────────
         if backend == "onnx":
+            sess_opts = _ort_session_options()
             self.ort_session = ort.InferenceSession(
                 str(onnx_path),
+                sess_options=sess_opts,
                 providers=["CPUExecutionProvider"],
             )
+            inputs = self.ort_session.get_inputs()
+            self._input_name = inputs[0].name if inputs else "input"
             self.model = None
         else:
             self.model = self._build_model(len(self.classes))
             if pt_path and Path(pt_path).exists():
-                ckpt = torch.load(pt_path, map_location=target_device)
+                ckpt = torch.load(pt_path, map_location=target_device, weights_only=False)
                 state = ckpt.get("state_dict", ckpt)
                 self.model.load_state_dict(state)
             self.model.to(target_device).eval()
+            self.ort_session = None
 
-        self.device  = target_device
+        self.device = target_device
         self.backend = backend
-        self._pt_path   = pt_path
+        self._pt_path = pt_path
         self._onnx_path = onnx_path
+        self._batch_size = (
+            _DEFAULT_BATCH_GPU if target_device == "cuda" else _DEFAULT_BATCH_CPU
+        )
 
-        # ── 预处理 transform ─────────────────────────
         self.transform = T.Compose([
             T.Resize((self.img_size + 16, self.img_size + 16)),
             T.CenterCrop(self.img_size),
             T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
         self.loaded = True
@@ -112,160 +142,100 @@ class InferenceEngine:
             dev_str = "CPU"
         return (
             f"模型加载成功  [{self.backend.upper()} / {dev_str}]  "
-            f"{len(self.classes)} 类别"
+            f"{len(self.classes)} 类别 · {self.img_size}px · batch={self._batch_size}"
         )
 
     def reload(self) -> str:
-        """用相同路径重新加载（训练完成后热更新调用）。"""
-        use_gpu = (self.device == "cuda")
+        use_gpu = self.device == "cuda"
         return self.load(self._pt_path, self._onnx_path, use_gpu=use_gpu)
 
-    # ──────────────────────────────────────────────────
-    # 推理
-    # ──────────────────────────────────────────────────
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, image_path: str) -> Dict:
-        """
-        单张图像预测。
-        返回:
-            {
-                "path":       str,
-                "class":      str,
-                "class_idx":  int,
-                "confidence": float,           # 0~1
-                "all_scores": {cls: float},    # softmax 全类别得分
-                "elapsed_ms": float,
-            }
-        """
         if not self.loaded:
-            raise RuntimeError('模型未加载，请先在「设置」页面加载模型。')
+            raise RuntimeError("模型未加载，请先在「设置」页面加载模型。")
 
         t0 = time.perf_counter()
-        tensor = self._preprocess(image_path)     # (1, 3, H, W)
-
         if self.backend == "onnx":
-            ort_out = self.ort_session.run(
-                None, {"input": tensor.numpy()}
-            )[0]                                  # (1, C)
-            scores = torch.softmax(
-                torch.from_numpy(ort_out), dim=1
-            )[0].numpy()
+            tensor = self._preprocess(image_path)
+            logits = self.ort_session.run(
+                None, {self._input_name: tensor.numpy()},
+            )[0][0]
+            result = logits_row_to_result(
+                str(image_path), logits, self.classes, self._thr_vec,
+            )
         else:
-            tensor  = tensor.to(self.device)
-            logits  = self.model(tensor)
-            scores  = torch.softmax(logits, dim=1)[0].cpu().numpy()
+            tensor = self._preprocess(image_path)
+            logits = self.model(tensor.to(self.device)).detach().cpu().numpy()[0]
+            result = logits_row_to_result(
+                str(image_path), logits, self.classes, self._thr_vec,
+            )
 
-        pred_idx = self._decide_class(scores)
-        elapsed  = (time.perf_counter() - t0) * 1000
+        result["elapsed_ms"] = (time.perf_counter() - t0) * 1000
+        return result
 
-        return {
-            "path":       str(image_path),
-            "class":      self.classes[pred_idx],
-            "class_idx":  pred_idx,
-            "confidence": float(scores[pred_idx]),
-            "all_scores": {c: float(s)
-                           for c, s in zip(self.classes, scores)},
-            "elapsed_ms": elapsed,
-            # 以下字段供 UI 使用，不由推理填写
-            "true_class":    "",
-            "flagged":       False,
-            "correction_saved": False,
-        }
-
+    @torch.inference_mode()
     def predict_batch(
         self,
         image_paths: List[str],
         progress_cb: Optional[Callable[[int, int], None]] = None,
+        result_cb: Optional[Callable[[int, Dict], None]] = None,
+        batch_size: Optional[int] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> List[Dict]:
-        """批量预测；progress_cb(current, total) 每完成一张回调。"""
-        results = []
-        total   = len(image_paths)
-        for i, path in enumerate(image_paths):
-            try:
-                r = self.predict(path)
-            except Exception as exc:
-                r = self._error_result(path, str(exc))
-            results.append(r)
-            if progress_cb:
-                progress_cb(i + 1, total)
-        return results
+        if not self.loaded:
+            raise RuntimeError("模型未加载，请先在「设置」页面加载模型。")
 
-    # ──────────────────────────────────────────────────
-    # 内部辅助
-    # ──────────────────────────────────────────────────
-    def _preprocess(self, image_path: str) -> torch.Tensor:
-        img = Image.open(image_path).convert("RGB")
-        return self.transform(img).unsqueeze(0)   # (1, 3, H, W)
+        if self.backend == "onnx":
+            session = self.ort_session
+            input_name = self._input_name
 
-    def _read_meta(
-        self,
-        pt_path: Optional[str],
-        onnx_path: Optional[str],
-    ) -> Tuple[List[str], int]:
-        """从 checkpoint 或 class_map.json 读取类别列表和图像尺寸。"""
-        classes, img_size = [], 224
+            def _preprocess_chw(path: str) -> np.ndarray:
+                return self._preprocess(path)[0].numpy()
 
-        if pt_path and Path(pt_path).exists():
-            ckpt = torch.load(pt_path, map_location="cpu")
-            classes  = ckpt.get("classes",  [])
-            img_size = ckpt.get("img_size", 224)
+            def _infer_batch(batch: np.ndarray) -> np.ndarray:
+                return session.run(None, {input_name: batch})[0]
 
-        if not classes:
-            # 尝试同目录的 class_map.json
-            for base in filter(None, [pt_path, onnx_path]):
-                map_path = Path(base).parent / "class_map.json"
-                if map_path.exists():
-                    with open(map_path, "r", encoding="utf-8") as f:
-                        d = json.load(f)
-                    classes = d.get("classes", [])
-                    break
-
-        if not classes:
-            # 尝试 train_config.json
-            for base in filter(None, [pt_path, onnx_path]):
-                cfg_path = Path(base).parent / "train_config.json"
-                if cfg_path.exists():
-                    with open(cfg_path, "r", encoding="utf-8") as f:
-                        d = json.load(f)
-                    classes  = d.get("classes",  [])
-                    img_size = d.get("img_size", 224)
-                    break
-
-        if not classes:
-            raise FileNotFoundError(
-                "未能获取类别信息。"
-                "请确保 class_map.json 或 train_config.json 与模型文件在同一目录。"
+            return run_batch_predict(
+                image_paths,
+                batch_size=batch_size or self._batch_size,
+                preprocess_one=_preprocess_chw,
+                stack_batch=lambda ts: np.stack(ts, axis=0).astype(np.float32, copy=False),
+                infer_batch=_infer_batch,
+                classes=self.classes,
+                thr_vec=self._thr_vec,
+                progress_cb=progress_cb,
+                result_cb=result_cb,
+                should_stop=should_stop,
             )
-        return classes, img_size
 
-    def _read_class_thresholds(
-        self,
-        pt_path: Optional[str],
-        onnx_path: Optional[str],
-    ) -> Optional[Dict[str, float]]:
-        """读取 train.py 生成的 class_thresholds.json（可选）。"""
-        for base in filter(None, [pt_path, onnx_path]):
-            thr_path = Path(base).parent / "class_thresholds.json"
-            if thr_path.exists():
-                with open(thr_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        return None
+        model = self.model
+        device = self.device
 
-    def _decide_class(self, scores: np.ndarray) -> int:
-        """
-        有 per-class 阈值时：仅在 score >= 阈值的类别中取最高分；
-        否则回退 argmax。
-        """
-        if not self.class_thresholds:
-            return int(np.argmax(scores))
-        thr = np.array([
-            self.class_thresholds.get(c, 0.5) for c in self.classes
-        ], dtype=np.float32)
-        mask = scores >= thr
-        if mask.any():
-            candidates = np.where(mask)[0]
-            return int(candidates[np.argmax(scores[candidates])])
-        return int(np.argmax(scores))
+        def _preprocess_chw(path: str) -> torch.Tensor:
+            return self._preprocess(path)[0]
+
+        def _stack(tensors: List[torch.Tensor]) -> torch.Tensor:
+            return torch.stack(tensors).to(device)
+
+        def _infer_batch(batch: torch.Tensor) -> np.ndarray:
+            return model(batch).detach().cpu().numpy()
+
+        return run_batch_predict(
+            image_paths,
+            batch_size=batch_size or self._batch_size,
+            preprocess_one=_preprocess_chw,
+            stack_batch=_stack,
+            infer_batch=_infer_batch,
+            classes=self.classes,
+            thr_vec=self._thr_vec,
+            progress_cb=progress_cb,
+            result_cb=result_cb,
+            should_stop=should_stop,
+        )
+
+    def _preprocess(self, image_path: str) -> torch.Tensor:
+        with Image.open(image_path) as im:
+            return self.transform(im.convert("RGB")).unsqueeze(0)
 
     @staticmethod
     def _build_model(num_classes: int) -> nn.Module:
@@ -277,7 +247,7 @@ class InferenceEngine:
                 nn.Linear(in_f, num_classes),
             )
         except AttributeError:
-            m = models.resnet18(pretrained=False)
+            m = models.resnet18(weights=None)
             in_f = m.fc.in_features
             m.fc = nn.Sequential(
                 nn.Dropout(p=0.3),
@@ -285,17 +255,4 @@ class InferenceEngine:
             )
         return m
 
-    @staticmethod
-    def _error_result(path: str, err: str) -> Dict:
-        return {
-            "path":       str(path),
-            "class":      "读取失败",
-            "class_idx":  -1,
-            "confidence": 0.0,
-            "all_scores": {},
-            "elapsed_ms": 0.0,
-            "error":      err,
-            "true_class": "",
-            "flagged":    False,
-            "correction_saved": False,
-        }
+    _error_result = staticmethod(make_error_result)

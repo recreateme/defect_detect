@@ -1,394 +1,274 @@
-# 图像缺陷分类系统 — 使用说明
+# 钻石缺陷图像分类系统
 
-基于 EfficientNet-B0 的工业缺陷五分类系统，包含数据分析、模型训练、PyQt5 部署应用与主动学习闭环。
+基于 **EfficientNet-B0** 的工业钻石缺陷 **五分类** 系统：数据分析、训练、PyQt5 检测应用与主动学习闭环。
+
+| 类别 | 说明 |
+|------|------|
+| 局部破损 | 钻石表面局部损伤 |
+| 断钻 | 钻具断裂相关缺陷 |
+| 棱边朝上 | 棱边朝向检测 |
+| 点朝上 | 顶点朝向检测 |
+| 面朝上 | 底面/面朝上检测 |
+
+当前模型（见 `checkpoints/train_config.json`）：输入 **128×128**，验证 Macro-F1 ≈ **0.90**，Accuracy ≈ **95%**。
 
 ---
 
-## 项目文件结构
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| **本文 (README.md)** | 环境、训练、应用功能、工作流 |
+| [打包部署说明.md](打包部署说明.md) | 机台 exe 打包、GPU 部署、故障排查 |
+| [QT应用开发说明.md](QT应用开发说明.md) | PyQt5 界面结构、信号槽、线程（改 UI 时阅读） |
+
+---
+
+## 项目结构
 
 ```
 defects_classify/
-├── analyze_image_sizes.py   # 阶段一：图像尺寸统计分析，推荐 img_size
-├── train.py                 # 阶段二：训练管线（四层不均衡策略 + Pipeline）
-├── inference_engine.py      # 推理引擎（PyTorch GPU / ONNX CPU 双后端）
-├── app.py                   # PyQt5 部署应用（主入口）
-├── requirements.txt         # Python 依赖
-├── README.md
+├── app.py                    # 开发版 GUI 入口（PyTorch + ONNX + SAHI）
+├── app_deploy.py             # 机台版入口（仅 ONNX，PyInstaller 打包用）
+├── train.py                  # 训练 / 微调 / ONNX 导出
+├── inference_engine.py       # 开发版推理（PyTorch GPU 优先，支持批量）
+├── inference_engine_onnx.py  # 机台版推理（ONNX Runtime GPU/CPU）
+├── inference_common.py       # 推理公共逻辑（批量循环、阈值、softmax，开发/机台共用）
+├── sahi_detector.py          # SAHI 大图切片检测 + 缺陷分类流水线（仅开发版）
+├── app_paths.py              # 路径解析（开发 / 打包 exe 通用）
+├── analyze_image_sizes.py    # 图像尺寸统计，推荐 img_size
+├── requirements.txt          # 开发 / 训练依赖（含 ultralytics、opencv-python）
+├── requirements-deploy.txt   # 机台打包专用依赖（无 PyTorch / SAHI）
+├── 缺陷分类系统.spec           # PyInstaller 规格参考（打包请以 build_deploy.py 为准）
 ├── scripts/
-│   └── build_win.bat        # Windows PyInstaller 一键打包
-│
-├── data/                    # 训练数据集（用户提供，不纳入 Git）
-│   ├── 局部破损/
-│   ├── 断钻/
-│   └── ...
-│
-├── checkpoints/             # 训练产物（建议纳入 Git 或单独分发）
-│   ├── best_model.pt        # PyTorch 权重（GPU 推理 / 再训练）
-│   ├── model.onnx           # ONNX 模型（CPU 加速推理）
-│   ├── class_map.json       # 类别名 ↔ index
-│   ├── class_thresholds.json# 逐类最优阈值（提升少数类召回）
-│   ├── train_config.json    # 训练超参与指标
-│   ├── dataset_split_seed42.json  # train/val 划分缓存（增量训练复用）
-│   ├── training_curves.png
-│   └── confusion_matrix.png
-│
-├── outputs/                 # analyze_image_sizes.py 输出
-├── corrections/             # 应用误分类修正归档（主动学习）
-└── app_config.json          # 应用运行时配置（首次启动后生成）
+│   ├── build_deploy.py       # 机台打包主脚本（推荐）
+│   ├── build_deploy.bat      # 上述脚本 Windows 快捷方式
+│   ├── setup_deploy_env.ps1  # 创建 defects-deploy Conda 环境
+│   ├── verify_deploy.py      # 打包前 ORT + 模型验收
+│   └── verify_frozen_sim.py  # 打包后 exe 验收（DEFECTS_VERIFY=1）
+├── pyinstaller_hooks/
+│   └── rthook_ort_dll.py     # PyInstaller runtime hook（ORT / CUDA DLL）
+├── checkpoints/              # 模型与配置（训练产出，纳入版本库）
+├── data/                     # 训练数据（按类别分子文件夹，git 忽略）
+├── corrections/              # 误分类修正归档（git 忽略）
+├── outputs/                  # analyze_image_sizes 等工具输出（git 忽略）
+├── sahi_output/              # 钻石检测分类默认输出（git 忽略）
+├── build_staging/            # 打包临时目录（checkpoints / cuda_deps，git 忽略）
+└── dist/缺陷分类系统/        # 打包输出（git 忽略）
 ```
 
 ---
 
-## 环境安装
+## 环境
 
-推荐使用 Conda 独立环境（示例：`cv-yolo`）。
+### 开发 / 训练（`cv-yolo` 或自建环境）
 
-```bash
-# GPU（CUDA 11.8 示例，按本机 CUDA 版本选择）
+```powershell
+conda activate cv-yolo
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# CPU 机台
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-# 其余依赖
 pip install -r requirements.txt
 ```
 
-验证 GPU：
+验证 GPU：`python -c "import torch; print(torch.cuda.is_available())"`
 
-```bash
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+> **RTX 50 系列（sm_120）**：若 PyTorch 版本不支持当前 GPU 算力，SAHI 切片推理会在 `auto` 模式下自动回退 CPU，或安装支持 sm_120 的 PyTorch（CUDA 12.8+ / nightly）。
+
+### 机台打包（`defects-deploy`，与训练环境隔离）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup_deploy_env.ps1
+conda activate defects-deploy
 ```
+
+详见 [打包部署说明.md](打包部署说明.md)。
 
 ---
 
-## 完整工作流
+## 工作流
 
-### Step 1  分析图像尺寸
+### 1. 分析图像尺寸
 
-```bash
+```powershell
 python analyze_image_sizes.py --data_dir data
 ```
 
-查看控制台「推荐统一输入分辨率」。本项目实测 **128×128** 即可（小图、已离线增强）。
+默认输出到 `outputs/`（`image_size_stats.csv`、`image_size_distribution.png`）。  
+本项目实测 **128×128** 即可。
 
-### Step 2  训练模型
+### 2. 训练
 
-```bash
-# 推荐：GPU + 默认参数（128 分辨率、Focal Loss、类别权重）
+```powershell
 python train.py --data_dir data --img_size 128
-
-# 或使用绝对路径（任意工作目录均可）
-"D:\Software\MiniAnaconda\envs\cv-yolo\python.exe" "D:\...\defects_classify\train.py"
 ```
 
-训练完成后检查 `checkpoints/`：
+| checkpoints 文件 | 用途 |
+|------------------|------|
+| `best_model.pt` | 开发版 GPU 推理、微调 |
+| `model.onnx` / `model.onnx.data` | 机台 ONNX 推理 |
+| `class_map.json` | 类别名与索引 |
+| `train_config.json` | **img_size**、Macro-F1 等（推理必读） |
+| `class_thresholds.json` | 逐类置信度阈值 |
+| `dataset_split_seed42.json` | 数据集划分记录 |
+| `training_curves.png` | 训练曲线 |
 
-| 文件 | 用途 |
-|------|------|
-| `best_model.pt` | GPU 推理、增量训练 |
-| `model.onnx` | 无 GPU 机台 CPU 加速 |
-| `class_thresholds.json` | 推理时逐类阈值（自动被 inference_engine 读取） |
-| `confusion_matrix.png` | 查看哪两类易混淆 |
+仅补跑 ONNX / 阈值：`python train.py --postprocess_only`
 
-### Step 3  启动应用
+### 3. 启动应用
 
-```bash
+```powershell
+# 开发机（完整功能，窗口标题无「机台版」）
 python app.py
+
+# 机台模式本地调试（仅 ONNX，标题显示「· 机台版」）
+python app_deploy.py
 ```
 
-首次启动会尝试加载 `checkpoints/best_model.pt`；可在「设置」页修改模型路径、置信度阈值、GPU 开关。
+首次运行会在 exe/项目根生成 `app_config.json`（模型路径、GPU 开关等）。
+
+### 4. 机台打包
+
+```powershell
+conda activate defects-deploy
+python scripts/build_deploy.py
+```
+
+产物：`dist/缺陷分类系统/`，**整包**复制到机台。说明见 [打包部署说明.md](打包部署说明.md)。
 
 ---
 
-## 训练参数建议
+## 推理架构
 
-### 四层不均衡学习（train.py 内置）
+开发与机台**共用** `inference_common.py`，各自引擎只负责后端差异，避免单张/批量结果不一致：
 
-| 层级 | 机制 | 默认 | 说明 |
-|------|------|------|------|
-| 第一层 | WeightedRandomSampler | 离线增强时关闭 | 原始未增强数据用 `--no_pre_augmented` 开启 |
-| 第二层 | 逆频类别权重 | 开启 | `--no_class_weight` 可关 |
-| 第三层 | Focal Loss (γ=2) | 开启 | `--no_focal_loss` 改用加权 CE |
-| 第四层 | Macro-F1 选模 + 阈值校准 | 开启 | 少数类 F1 低会拉低整体，比 Accuracy 更可靠 |
-
-### 按场景选择参数
-
-#### 场景 A：首次训练（当前 data/ 已离线增强）
-
-```bash
-python train.py --data_dir data --img_size 128 --batch_size 32
+```
+app.py / app_deploy.py
+    └─ InferenceEngine（按环境二选一）
+         ├─ inference_engine.py      开发：PyTorch GPU 优先，无 GPU 时 ONNX CPU 回退
+         └─ inference_engine_onnx.py  机台：ONNX Runtime GPU/CPU（打包 exe 专用）
+              └─ inference_common.py   元数据、run_batch_predict、logits→结果、阈值决策
 ```
 
-- 保持默认 `--pre_augmented`（轻量翻转，避免二次强增强）
-- 关注日志中 **Macro-F1** 与 `★` 标记的最优 epoch
-- 少数类「局部破损」样本 <10% 时，默认四层策略即可
+| 模块 | 开发机 | 机台 exe |
+|------|--------|----------|
+| `inference_engine.py` | ✅（含 PyTorch） | ❌ 不打包 |
+| `inference_engine_onnx.py` | 仅 `app_deploy.py` 调试 | ✅ |
+| `inference_common.py` | ✅ | ✅（纯 NumPy，体积极小） |
 
-#### 场景 B：原始图、未做离线增强
-
-```bash
-python train.py --no_pre_augmented --img_size 128 --batch_size 16
-```
-
-- 启用 WeightedRandomSampler + 完整在线增强
-- 可适当增加 `--epochs_phase2 30`
-
-#### 场景 C：误分类修正后再训练（主动学习）
-
-```bash
-python train.py --finetune --extra_data_dirs corrections --lr_phase2 5e-5
-```
-
-- `--finetune`：自动加载 `best_model.pt`，**跳过阶段一**
-- 合并 `data/` + `corrections/`，划分缓存自动复用（除非 `--no_reuse_split`）
-- 学习率宜低于首次训练，防止灾难性遗忘
-
-#### 场景 D：仅补跑阈值校准 / ONNX（训练已完成）
-
-```bash
-python train.py --postprocess_only
-```
-
-#### 场景 E：CPU 训练（无 GPU）
-
-```bash
-python train.py --batch_size 8 --num_workers 0
-```
-
-### 关键参数速查
-
-| 参数 | 默认 | 建议 |
-|------|------|------|
-| `--img_size` | 128 | 与 analyze 推荐一致；改尺寸需重训 |
-| `--batch_size` | 32 | GPU 显存不足时 16/8 |
-| `--epochs_phase1` | 5 | 增量微调时设 0 或用 `--finetune` |
-| `--epochs_phase2` | 20 | 数据增多可 25~30 |
-| `--lr_phase2` | 1e-4 | 微调 corrections 时用 5e-5 ~ 1e-5 |
-| `--patience` | 8 | 验证 F1 连续 8 轮不升则早停 |
-| `--val_ratio` | 0.15 | 样本极少时可 0.1 |
-| `--seed` | 42 | 固定可复现；改 seed 需 `--no_reuse_split` |
+修改批量推理、置信度、阈值逻辑时，**优先改 `inference_common.py`**；仅 PyTorch 加载或 ORT Provider 差异才改对应 engine。
 
 ---
 
-## 识别与部署参数建议
+## 推理说明
 
-### 推理后端选择
+| 场景 | 引擎 | 批量检测 |
+|------|------|----------|
+| 开发机 + NVIDIA GPU | `inference_engine.py` → PyTorch | `predict_batch`，默认 batch=32 |
+| 开发机无 GPU | ONNX CPU 回退 | 同上 |
+| 机台 exe | `inference_engine_onnx.py` | 同上，GPU 时 batch=32 |
 
-| 环境 | 推荐后端 | 配置 |
-|------|----------|------|
-| 有 NVIDIA GPU | PyTorch + `.pt` | 设置页「使用 GPU」开启 |
-| 纯 CPU 产线机 | ONNX + `onnxruntime` | 关闭 GPU，确保 `model.onnx` 存在 |
-| 两者都有 | 自动：GPU 优先，否则 ONNX | 默认行为 |
+批量检测由 `InferenceWorker` 调用 `predict_batch`（内部走 `run_batch_predict`），比逐张 `predict` 更快（尤其 GPU）。  
+单张与批量经同一套 logits → softmax → 阈值决策，**结果管理**与**单张检测**显示的类别、置信度一致。
 
-### 置信度阈值（应用「设置」页 `conf_threshold`）
+**img_size** 从 `train_config.json` 读取，须与训练一致（当前为 **128**）。
 
-- **0.5（默认）**：平衡模式，适合整体准确率优先
-- **0.6 ~ 0.7**：减少误报，适合「宁可漏检、不可错判」的质检场景
-- **0.3 ~ 0.4**：提高召回，配合 `class_thresholds.json` 对少数类更友好
+### 置信度含义
 
-### 关注混淆矩阵
+| 字段 | 含义 |
+|------|------|
+| `confidence` | **预测类别**的概率（经 `class_thresholds.json` 逐类阈值决策后） |
+| `max_confidence` / `max_class` | argmax 最高分类别（可能与预测类别不同） |
 
-训练后查看 `checkpoints/confusion_matrix.png`：
+启用逐类阈值时，单张页若预测类别非最高分，会提示「阈值决策；最高得分：…」。结果管理表格中的置信度始终为预测类别的概率。
 
-- 若「局部破损」常被误判为「断钻」→ 增加局部破损样本或 corrections 再 `--finetune`
-- 若某类 Precision 高、Recall 低 → 降低该类阈值（见 `class_thresholds.json` 中对应值）
+### 结果去重
 
-### 产线识别流程建议
+同一张图重复检测时，按规范化路径 **更新** 已有记录（保留修正类别、待修正标记），不会追加重复行。
 
-```
-采集图像 → app 批量检测 → 结果管理筛选低置信度
-        → 误分类修正归档 corrections/
-        → --finetune 再训练 → 应用新模型热更新
-```
+---
+
+## 训练参数（摘要）
+
+四层不均衡策略：类别权重 → Focal Loss → Macro-F1 选模 → 阈值校准。完整参数见 `train.py --help`。
+
+| 场景 | 命令 |
+|------|------|
+| 首次训练 | `python train.py --data_dir data --img_size 128` |
+| 误分类再训练 | `python train.py --finetune --extra_data_dirs corrections` |
+| 后处理 / ONNX | `python train.py --postprocess_only` |
 
 ---
 
 ## 应用功能
 
-| 页面 | 功能 |
-|------|------|
-| 缺陷检测 | 单张/文件夹批量检测，进度条 |
-| 结果管理 | 缩略图、置信度、筛选、导出 CSV |
-| 误分类修正 | 修正后保存至 `corrections/类别名/` |
-| 模型再训练 | 调用 `train.py`，日志实时显示，完成后热更新 |
-| 设置 | 模型路径、数据目录、GPU、置信度阈值 |
+| 页面 | 功能 | 开发版 | 机台版 |
+|------|------|--------|--------|
+| 钻石检测分类 | 5120×5120 大图 SAHI 切片检测 + 缺陷分类、批量推理 | ✅ | ❌ |
+| 缺陷检测 | 单张 / 文件夹批量检测、按类别导出 | ✅ | ✅ |
+| 结果管理 | 筛选、导出 CSV；与单张检测共用同一结果结构 | ✅ | ✅ |
+| 误分类修正 | 归档到 `corrections/`（按类别分子文件夹） | ✅ | ✅ |
+| 模型再训练 | 子进程训练；机台版默认只读 | ✅ | 只读 |
+| 设置 | **分类配置** Tab：模型路径、GPU；**切片推理配置** Tab：YOLO、SAHI 参数 | ✅ | 仅分类配置 |
 
----
+「模型再训练」「设置」默认只读，输入管理员密码后可编辑（密码定义于 `app.py` 中 `ADMIN_PAGE_PASSWORD`）。
 
-## 应用打包教程（Windows）
+### 钻石检测分类（开发版）
 
-将 PyQt5 应用打包为独立 `.exe`，便于在无 Python 环境的产线机台部署。
+1. 在「设置 → 切片推理配置」配置 YOLO 权重（`.pt`）、切片大小、重叠率、设备等
+2. 在「设置 → 分类配置」加载缺陷分类模型
+3. 在「钻石检测分类」选择输入图像（多选或文件夹）与结果保存目录
+4. 点击「开始处理」→ 每张图输出：裁剪图、两张全分辨率可视化图（检测框 / 分类着色）、JSON 统计；完成后可打开保存目录
 
-### 方案选择
-
-| 方案 | 体积 | 适用 | 说明 |
-|------|------|------|------|
-| **A. CPU 轻量包** | ~200–400 MB | 无 GPU 检测工位 | 打包 ONNX + onnxruntime，不含 CUDA |
-| **B. GPU 完整包** | ~2 GB+ | 带 NVIDIA GPU 工位 | 含 torch+cuda，体积大，一般不推荐 PyInstaller |
-
-**推荐方案 A**：检测端用 ONNX CPU；训练仍在开发机完成。
-
-### 前置准备
-
-```bash
-conda activate cv-yolo
-pip install pyinstaller
-
-# 确保已有训练产物
-python train.py --postprocess_only
-```
-
-确认以下文件存在：
-
-```
-checkpoints/best_model.pt
-checkpoints/model.onnx
-checkpoints/class_map.json
-checkpoints/class_thresholds.json
-```
-
-### Step 1  创建打包入口（可选）
-
-默认直接打包 `app.py` 即可。若需自定义图标，准备 `icon.ico` 放在项目根。
-
-### Step 2  执行 PyInstaller
-
-**方式一（推荐）**：使用项目自带脚本
-
-```powershell
-cd "D:\工作记录\3 人工智能相关课题\张旭\defects_classify"
-conda activate cv-yolo
-
-# 默认：窗口模式 + 内置 checkpoints/
-scripts\build_win.bat
-
-# 不打包模型（exe 更小，checkpoints 单独拷贝）
-scripts\build_win.bat slim
-
-# 保留控制台窗口（排查闪退）
-scripts\build_win.bat console
-```
-
-**方式二**：手动命令
-
-在项目根目录执行（PowerShell）：
-
-```powershell
-cd "D:\工作记录\3 人工智能相关课题\张旭\defects_classify"
-
-pyinstaller --noconfirm --clean `
-  --name "缺陷分类系统" `
-  --windowed `
-  --add-data "checkpoints;checkpoints" `
-  --hidden-import "PyQt5.sip" `
-  --hidden-import "onnxruntime" `
-  --hidden-import "PIL" `
-  --collect-all onnxruntime `
-  app.py
-```
-
-说明：
-
-- `--windowed`：不显示黑色控制台窗口
-- `--add-data "checkpoints;checkpoints"`：Windows 用分号；将模型与配置打入包内
-- `--collect-all onnxruntime`：收集 ONNX Runtime 原生 DLL
-
-### Step 3  获取产物
-
-```
-dist/缺陷分类系统/
-  缺陷分类系统.exe
-  checkpoints/          ← 内置模型（可整体拷贝到其他机器）
-  ... 依赖 dll ...
-```
-
-将整个 `dist/缺陷分类系统/` 文件夹复制到目标机器，双击 `缺陷分类系统.exe` 运行。
-
-### Step 4  打包后配置
-
-首次运行会在 exe 同目录生成 `app_config.json`。若需更新模型：
-
-1. 在开发机重新训练，覆盖 `checkpoints/` 下文件
-2. 将新 `checkpoints/` 复制到 exe 目录（或仅替换 `best_model.pt`、`model.onnx`、`class_thresholds.json`）
-3. 重启应用或在设置页重新加载
-
-### Step 5  常见问题排查
-
-| 现象 | 处理 |
-|------|------|
-| 双击 exe 闪退 | 去掉 `--windowed` 重新打包，在 cmd 中运行 exe 查看报错 |
-| 找不到模型 | 确认 `checkpoints` 与 exe 同级；设置页检查路径 |
-| 中文乱码 | 确保系统已安装「微软雅黑」等字体 |
-| 体积过大 | 使用 CPU 版 torch 或方案 A 仅 onnxruntime |
-| 杀毒软件拦截 | 添加白名单；或对 `dist` 目录签名 |
-
-### 进阶：分离模型包（减小 exe 更新体积）
-
-打包时不内置 `checkpoints`，改为产线机手动放置：
-
-```powershell
-pyinstaller --noconfirm --windowed --name "缺陷分类系统" app.py
-```
-
-部署结构：
-
-```
-产线部署/
-  缺陷分类系统.exe
-  checkpoints/          ← 单独拷贝，更新模型时只换此目录
-  app_config.json
-```
+默认保存目录：`sahi_output/`（可在设置或页面中修改，写入 `app_config.json` 的 `sahi_output_dir`）。
 
 ---
 
 ## 主动学习闭环
 
 ```
-运行检测 → 结果管理标记误分类 → 误分类修正保存到 corrections/
-        → 再训练页 / 命令行 --finetune → 应用新模型 → 继续检测
+检测 → 误分类修正 → corrections/ → 开发机 --finetune → 更新 checkpoints → 机台替换模型
 ```
-
-应用内再训练会自动附加 `--extra_data_dirs corrections --num_workers 0`。
 
 ---
 
 ## 常见问题
 
-**Q: 命令行报 `No such file or directory`（data）？**  
-A: 使用 `train.py` 的绝对路径启动，或先 `cd` 到项目根。路径均相对 `train.py` 所在目录解析。
+**Q: 单张检测与结果管理置信度不一致？**  
+A: 请使用最新代码（`inference_common.run_batch_predict` 统一单张/批量）。若预测类别因阈值与最高分不同，属正常；看 `confidence`（预测类）而非得分条第一名。
 
-**Q: 训练结束报 CUDA/CPU tensor 不一致？**  
-A: 已修复：阈值校准在 ONNX 导出之前执行。若仍遇到，运行 `python train.py --postprocess_only`。
+**Q: 开发机批量检测报 `requires grad`？**  
+A: 确保 `inference_engine.py` 的 `predict_batch` 带 `@torch.inference_mode()`（机台 exe 不受影响，不含 PyTorch）。
 
-**Q: Accuracy 很高但少数类仍漏检？**  
-A: 看 Macro-F1 与混淆矩阵；使用 `class_thresholds.json`；增加少数类 corrections 后 `--finetune`。
+**Q: 机台检测报输入尺寸 224 vs 128？**  
+A: 确保 `checkpoints/train_config.json` 含正确 `img_size`，并重新加载模型或使用最新 exe。
 
-**Q: ONNX 导出警告 opset 版本？**  
-A: 可忽略；当前使用 opset 18，ORT 验证通过即可。
+**Q: 只更新模型不重装 exe？**  
+A: 覆盖机台 `checkpoints/` 下 `model.onnx`、`model.onnx.data`、`class_thresholds.json`、`train_config.json`、`class_map.json` 等，重启或在设置页重新加载。
 
-**Q: Windows 多进程 DataLoader 报错？**  
-A: 训练默认 `--num_workers 0`，应用内再训练已强制该参数。
+**Q: 训练路径找不到 data？**  
+A: `train.py` 会自动解析项目根目录，也可显式指定 `--data_dir`；确保 `data/` 下按类别分子文件夹。
 
-**Q: 如何只更新模型不重装 exe？**  
-A: 仅替换 `checkpoints/` 下 `best_model.pt`、`model.onnx`、`class_thresholds.json`，应用内点击重新加载。
+**Q: 直接用 `缺陷分类系统.spec` 打包？**  
+A: 不推荐。请使用 `python scripts/build_deploy.py`，它会动态收集 CUDA DLL、复制 checkpoints 并执行打包后补丁。
+
+**Q: 机台 exe 能用钻石检测分类吗？**  
+A: 不能。SAHI / YOLO 依赖 ultralytics 与 PyTorch，仅 `python app.py` 开发版提供；机台 exe 仅含 ONNX 缺陷分类。
+
+**Q: SAHI 报 CUDA error 或 GPU 不兼容？**  
+A: 在「设置 → 切片推理配置」将设备设为 `auto` 或 `cpu`；新型号 GPU 需升级 PyTorch 后再用 `cuda:0`。
 
 ---
 
 ## 命令速查
 
-```bash
-# 首次训练
+```powershell
+python analyze_image_sizes.py --data_dir data
 python train.py --data_dir data --img_size 128
-
-# 增量微调（含 corrections）
 python train.py --finetune --extra_data_dirs corrections
-
-# 后处理补跑
 python train.py --postprocess_only
-
-# 启动 GUI
 python app.py
-
-# Windows 打包 exe（需先 conda activate cv-yolo）
-scripts\build_win.bat
+python app_deploy.py
+conda activate defects-deploy
+python scripts/build_deploy.py
+python scripts/verify_deploy.py
+python scripts/verify_frozen_sim.py
 ```

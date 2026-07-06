@@ -1,0 +1,9 @@
+# 机台 ONNX-GPU 精简部署（不含 PyTorch）— 仅用于 defects-deploy 打包环境
+PyQt5>=5.15
+Pillow>=10.0
+numpy>=1.24,<2.5
+onnxruntime-gpu==1.20.1
+nvidia-cudnn-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cublas-cu12
+pyinstaller>=6.0
