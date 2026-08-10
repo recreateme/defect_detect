@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""应用路径解析：开发环境 / PyInstaller 打包后均可正确定位资源。"""
+"""
+应用路径解析与 ORT 原生 DLL 搜索路径。
+
+开发环境与 PyInstaller 冻结环境均可定位资源。
+Windows 上 DLL 配置采用双点：
+  · pyinstaller_hooks/rthook_ort_dll.py — 冻结进程最早执行（不 import 本模块）
+  · setup_ort_dll_paths() — 业务入口 / import onnxruntime 前的统一入口（含 preload）
+清除 CUDA_PATH/CUDA_HOME，避免机台旧 Toolkit 抢先加载错误 cudart。
+"""
 
 from __future__ import annotations
 
@@ -124,8 +132,9 @@ def _preload_ort_core_dlls(capi: Path) -> None:
 
 def setup_ort_dll_paths() -> None:
     """
-    Windows 下将 onnxruntime / CUDA 原生 DLL 目录加入搜索路径。
-    打包环境会隔离 PATH，避免机台已装旧版 CUDA 导致 DLL 冲突。
+    Windows 下将 onnxruntime / CUDA 原生 DLL 目录加入搜索路径，并预加载 ORT 核心 DLL。
+    打包环境优先使用捆绑目录，保留系统 PATH（完全替换会导致 _ctypes 等无法加载）。
+    须在 import onnxruntime 之前调用。
     """
     if sys.platform != "win32":
         return
@@ -148,8 +157,9 @@ def setup_ort_dll_paths() -> None:
             os.add_dll_directory(p)
         prepend_parts.append(p)
 
-    if is_frozen():
-        # 机台：优先使用打包目录，保留系统 PATH（完全替换会导致 _ctypes 等无法加载）
+    if prepend_parts:
+        # 冻结与开发均前置打包/站点 DLL，避免被系统旧库抢先
         os.environ["PATH"] = os.pathsep.join(prepend_parts) + os.pathsep + os.environ.get("PATH", "")
-    elif prepend_parts:
-        os.environ["PATH"] = os.pathsep.join(prepend_parts) + os.pathsep + os.environ.get("PATH", "")
+
+    if capi_dir is not None:
+        _preload_ort_core_dlls(capi_dir)

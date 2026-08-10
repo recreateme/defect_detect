@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""验收机台部署路径：ORT 导入 + 模型加载。用法: python scripts/verify_deploy.py"""
+"""打包前验收：源码环境下 ORT 导入 + checkpoints/model.onnx 加载。用法: python scripts/verify_deploy.py"""
 
 from __future__ import annotations
 

@@ -5,13 +5,13 @@ Slicing Aided Hyper Inference (SAHI) 大图检测 + 缺陷分类流水线
 ================================================================================
 
 对 5120×5120（或其他大分辨率）图像执行：
-  1. 切片目标检测（SAHI：滑动窗口切片 → YOLO 批量推理 → IoU-NMS 去重）
-  2. 裁剪每个检测目标
-  3. 送入缺陷分类引擎（InferenceEngine）批量分类
+  1. 切片目标检测（滑动窗口 → YOLO 批量推理）
+  2. 后处理链：iou_nms → IoS 包含抑制 → 面积/长宽比过滤 → 边缘剔除
+  3. 裁剪每个检测目标 → 缺陷分类引擎批量分类
   4. 保存裁剪图、可视化图、JSON 结果与统计信息
 
 设计参考: data_process/pipeline/phase3_inference.py（产品级 24×24 网格推理）
-本模块针对**单张大图**简化：无需网格坐标、跨图 NMS，仅子图内 IoU-NMS。
+本模块针对**单张大图**简化：无需网格坐标、跨图 NMS。
 
 依赖:
   - ultralytics  (YOLO 推理，**仅开发环境**)
@@ -33,7 +33,7 @@ import time
 import logging
 import numpy as np
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Callable
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -179,6 +179,183 @@ def crop_with_padding(
 
 
 # ════════════════════════════════════════════════════════════════════════
+# 检测后处理 — IoS 包含抑制 / 面积过滤 / 边缘剔除
+# ════════════════════════════════════════════════════════════════════════
+
+def _pairwise_ios(dets: List[Detection]) -> np.ndarray:
+    """
+    计算两两框的 IoS（Intersection over Smaller）矩阵。
+
+    IoS = 交集面积 / min(两框面积)。当小框几乎被大框包含时 IoS→1，
+    而标准 IoU 会因并集偏大而偏小，故 IoS 更能捕捉「大框套小框」的冗余。
+    """
+    n = len(dets)
+    boxes = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32)
+    areas = np.maximum(0.0, boxes[:, 2] - boxes[:, 0]) * np.maximum(0.0, boxes[:, 3] - boxes[:, 1])
+
+    ios = np.zeros((n, n), dtype=np.float32)
+    for i in range(n):
+        xx1 = np.maximum(boxes[i, 0], boxes[:, 0])
+        yy1 = np.maximum(boxes[i, 1], boxes[:, 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[:, 2])
+        yy2 = np.minimum(boxes[i, 3], boxes[:, 3])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        smaller = np.minimum(areas[i], areas) + 1e-7
+        ios[i] = inter / smaller
+    return ios
+
+
+def suppress_contained_boxes(
+    dets: List[Detection],
+    ios_thresh: float = 0.65,
+) -> Tuple[List[Detection], List[Detection]]:
+    """
+    IoS 包含抑制 — 去除「被另一框大部分包含」的冗余小框。
+
+    对任意两框，若 IoS >= ios_thresh，判为包含型冗余，丢弃其中
+    置信度较低者（置信度相同则丢弃面积较小者）。
+
+    Returns:
+        (保留列表, 被剔除列表)
+    """
+    n = len(dets)
+    if n <= 1 or ios_thresh >= 1.0:
+        return list(dets), []
+
+    ios = _pairwise_ios(dets)
+    areas = [d.w * d.h for d in dets]
+    removed = [False] * n
+
+    for i in range(n):
+        if removed[i]:
+            continue
+        for j in range(i + 1, n):
+            if removed[j]:
+                continue
+            if ios[i, j] < ios_thresh:
+                continue
+            # 保留置信度高者；置信度相等保留面积大者
+            if dets[i].conf > dets[j].conf or (
+                dets[i].conf == dets[j].conf and areas[i] >= areas[j]
+            ):
+                removed[j] = True
+            else:
+                removed[i] = True
+                break
+
+    kept = [d for k, d in enumerate(dets) if not removed[k]]
+    dropped = [d for k, d in enumerate(dets) if removed[k]]
+    return kept, dropped
+
+
+def filter_small_area(
+    dets: List[Detection],
+    min_area_ratio: float = 0.45,
+    min_abs_area: Optional[float] = None,
+) -> Tuple[List[Detection], List[Detection]]:
+    """
+    面积过滤 — 剔除面积明显偏小的孤立误检框。
+
+    基准取本图检测框面积的中位数（对误检更鲁棒，避免被均值拉偏）：
+      · area < 中位数 * min_area_ratio  → 剔除
+      · area < min_abs_area（若提供）    → 剔除
+
+    Returns:
+        (保留列表, 被剔除列表)
+    """
+    if not dets:
+        return [], []
+
+    areas = np.array([d.w * d.h for d in dets], dtype=np.float32)
+    thresholds: List[float] = []
+    if min_area_ratio and min_area_ratio > 0:
+        thresholds.append(float(np.median(areas)) * min_area_ratio)
+    if min_abs_area and min_abs_area > 0:
+        thresholds.append(float(min_abs_area))
+
+    if not thresholds:
+        return list(dets), []
+
+    thr = max(thresholds)
+    kept = [d for d, a in zip(dets, areas) if a >= thr]
+    dropped = [d for d, a in zip(dets, areas) if a < thr]
+    return kept, dropped
+
+
+def filter_aspect_ratio(
+    dets: List[Detection],
+    max_aspect_ratio: float = 2.5,
+) -> Tuple[List[Detection], List[Detection]]:
+    """
+    长宽比过滤 — 剔除过于细长的异常检测框。
+
+    长宽比 = max(w, h) / min(w, h)（恒 ≥ 1）。钻石目标应接近正方形，
+    比例过大常见于切片边界截断或粘连误检。max_aspect_ratio <= 0 时关闭。
+
+    Returns:
+        (保留列表, 被剔除列表)
+    """
+    if not dets or not max_aspect_ratio or max_aspect_ratio <= 0:
+        return list(dets), []
+
+    kept: List[Detection] = []
+    dropped: List[Detection] = []
+    for d in dets:
+        w, h = d.w, d.h
+        if w <= 0 or h <= 0:
+            dropped.append(d)
+            continue
+        aspect = max(w, h) / min(w, h)
+        if aspect > max_aspect_ratio:
+            dropped.append(d)
+        else:
+            kept.append(d)
+    return kept, dropped
+
+
+def filter_edge_boxes(
+    dets: List[Detection],
+    W: int,
+    H: int,
+    edge_margin_px: float = 20,
+    drop_touching: bool = True,
+) -> Tuple[List[Detection], List[Detection]]:
+    """
+    边缘剔除 — 去除贴近图像边界 / 被边界截断的不完整目标。
+
+    这些边缘半颗钻石属分类模型的分布外输入，易把正常钻石误判为缺陷，
+    故在缺陷统计前剔除（调用方可单列 edge_skipped 以便追溯）。
+
+    edge_margin_px：距图像四边的像素边距带；框任一边落入该带内即剔除。
+    设为 0 且 drop_touching=True 时仍按 0 边距（仅触边剔除）。
+
+    Returns:
+        (保留列表, 被剔除列表)
+    """
+    if not dets:
+        return [], []
+
+    margin = max(0.0, float(edge_margin_px))
+    if margin <= 0 and not drop_touching:
+        return list(dets), []
+
+    kept: List[Detection] = []
+    dropped: List[Detection] = []
+    for d in dets:
+        near_edge = (
+            d.x1 <= margin
+            or d.y1 <= margin
+            or d.x2 >= W - margin
+            or d.y2 >= H - margin
+        )
+        if near_edge:
+            dropped.append(d)
+        else:
+            kept.append(d)
+    return kept, dropped
+
+
+# ════════════════════════════════════════════════════════════════════════
 # 设备解析 — 避免 sm_120 等新 GPU 被 torch.cuda.is_available() 误报可用
 # ════════════════════════════════════════════════════════════════════════
 
@@ -260,6 +437,15 @@ class SahiDetector:
         conf:            检测置信度阈值
         batch_size:      每批推理的切片数（按显存调整）
         nms_iou:         IoU-NMS 阈值（重叠去重）
+
+    后处理（检测后串联，去误检 + 剔除边缘不完整目标）:
+        ios_thresh:        IoS 包含抑制阈值；<=0 或 >=1 关闭
+        min_area_ratio:    面积过滤：相对本图中位面积的最小比例；<=0 关闭
+        min_abs_area:      面积绝对下限（像素²，可选）
+        max_aspect_ratio:  长宽比上限 max(w,h)/min(w,h)；<=0 关闭
+        edge_filter:       是否启用边缘剔除
+        edge_margin_px:    边缘边距（像素）；框触边距带内即剔除
+        drop_touching:     触边框是否剔除
     """
 
     def __init__(
@@ -271,6 +457,13 @@ class SahiDetector:
         conf: float = 0.35,
         batch_size: int = 8,
         nms_iou: float = 0.50,
+        ios_thresh: float = 0.65,
+        min_area_ratio: float = 0.45,
+        min_abs_area: Optional[float] = None,
+        max_aspect_ratio: float = 2.5,
+        edge_filter: bool = True,
+        edge_margin_px: float = 20,
+        drop_touching: bool = True,
     ):
         self.model_path = model_path
         self.device = device
@@ -279,6 +472,21 @@ class SahiDetector:
         self.conf = conf
         self.batch_size = batch_size
         self.nms_iou = nms_iou
+        # ── 后处理参数 ──
+        self.ios_thresh = ios_thresh
+        self.min_area_ratio = min_area_ratio
+        self.min_abs_area = min_abs_area
+        self.max_aspect_ratio = max_aspect_ratio
+        self.edge_filter = edge_filter
+        self.edge_margin_px = edge_margin_px
+        self.drop_touching = drop_touching
+        # 最近一次 detect() 的后处理剔除统计（供流水线读取写入 stats）
+        self.last_skip_stats: Dict[str, int] = {
+            "contained_skipped": 0,
+            "small_skipped": 0,
+            "aspect_skipped": 0,
+            "edge_skipped": 0,
+        }
         self._model = None
         self._loaded = False
 
@@ -317,13 +525,16 @@ class SahiDetector:
 
     def detect(self, img: np.ndarray) -> List[Detection]:
         """
-        对单张大图执行 SAHI 切片检测。
+        对单张大图执行 SAHI 切片检测 + 后处理。
+
+        后处理顺序：iou_nms → suppress_contained_boxes → filter_small_area
+        → filter_aspect_ratio → filter_edge_boxes（各步可由参数关闭）。
 
         Args:
             img: BGR 图像 (H, W, 3)
 
         Returns:
-            原图坐标系下的检测结果（已完成 IoU-NMS）
+            原图坐标系下保留的检测框列表
         """
         if not self._loaded:
             raise RuntimeError("YOLO 模型未加载，请先调用 load()")
@@ -352,8 +563,46 @@ class SahiDetector:
 
         # ── IoU-NMS 去重 ──────────────────────────────────────────
         result = iou_nms(raw, self.nms_iou)
+        after_nms = len(result)
+
+        # ── 后处理：IoS → 面积 → 长宽比 → 边缘剔除 ────────────────
+        contained_n = small_n = aspect_n = edge_n = 0
+
+        if self.ios_thresh and 0.0 < self.ios_thresh < 1.0:
+            result, dropped = suppress_contained_boxes(result, self.ios_thresh)
+            contained_n = len(dropped)
+
+        if (self.min_area_ratio and self.min_area_ratio > 0) or (
+            self.min_abs_area and self.min_abs_area > 0
+        ):
+            result, dropped = filter_small_area(
+                result, self.min_area_ratio or 0.0, self.min_abs_area,
+            )
+            small_n = len(dropped)
+
+        if self.max_aspect_ratio and self.max_aspect_ratio > 0:
+            result, dropped = filter_aspect_ratio(result, self.max_aspect_ratio)
+            aspect_n = len(dropped)
+
+        if self.edge_filter:
+            result, dropped = filter_edge_boxes(
+                result, W, H,
+                edge_margin_px=self.edge_margin_px,
+                drop_touching=self.drop_touching,
+            )
+            edge_n = len(dropped)
+
+        self.last_skip_stats = {
+            "contained_skipped": contained_n,
+            "small_skipped": small_n,
+            "aspect_skipped": aspect_n,
+            "edge_skipped": edge_n,
+        }
         logger.debug(
-            f"SAHI detect: 切片 {len(coords)} | 原始 {len(raw)} | NMS 后 {len(result)}"
+            f"SAHI detect: 切片 {len(coords)} | 原始 {len(raw)} | "
+            f"NMS 后 {after_nms} | 去包含 -{contained_n} | "
+            f"去小框 -{small_n} | 去长宽比 -{aspect_n} | "
+            f"去边缘 -{edge_n} | 最终 {len(result)}"
         )
         return result
 
@@ -402,16 +651,61 @@ class SahiDetector:
 VIS_DETECTION_NAME = "visualization_detection.jpg"   # 仅检测框，统一颜色
 VIS_CLASSIFIED_NAME = "visualization_classified.jpg"   # 按缺陷类别着色 + 中文标签
 
-# 缺陷类别颜色映射（BGR），与 class_map.json 五类对应
-DEFECT_COLORS: Dict[str, Tuple[int, int, int]] = {
-    "局部破损": (0, 165, 255),   # 橙
-    "断钻":     (0, 0, 255),     # 红
-    "棱边朝上": (255, 191, 0),   # 青
-    "点朝上":   (255, 0, 191),   # 紫
-    "面朝上":   (0, 255, 255),   # 黄
-    "ERROR":    (128, 128, 128), # 分类失败
-    "未分类":   (180, 180, 180),
+# 缺陷类别可视化配色（BGR 框/标签底 + RGB 字体），保证类别可区分且文字可读
+class DefectVisStyle(NamedTuple):
+    box_bgr: Tuple[int, int, int]       # 锚框描边色
+    label_bg_bgr: Tuple[int, int, int]   # 标签背景色
+    text_rgb: Tuple[int, int, int]       # 标签字体色
+
+
+_DEFAULT_VIS = DefectVisStyle(
+    box_bgr=(128, 128, 128),
+    label_bg_bgr=(70, 70, 70),
+    text_rgb=(255, 255, 255),
+)
+
+# 五类缺陷：框用高饱和色便于定位，标签用更深底色 + 高对比字体（避免浅黄底+白字）
+DEFECT_VIS_STYLES: Dict[str, DefectVisStyle] = {
+    "局部破损": DefectVisStyle(
+        box_bgr=(0, 140, 255),        # 亮橙框
+        label_bg_bgr=(0, 90, 190),    # 深橙底
+        text_rgb=(255, 255, 255),     # 白字
+    ),
+    "断钻": DefectVisStyle(
+        box_bgr=(50, 50, 240),        # 亮红框
+        label_bg_bgr=(25, 25, 165),   # 深红底
+        text_rgb=(255, 255, 255),     # 白字
+    ),
+    "棱边朝上": DefectVisStyle(
+        box_bgr=(220, 170, 0),        # 亮青框
+        label_bg_bgr=(155, 105, 0),   # 深青底
+        text_rgb=(255, 255, 255),     # 白字
+    ),
+    "点朝上": DefectVisStyle(
+        box_bgr=(210, 0, 210),        # 亮紫框
+        label_bg_bgr=(135, 0, 135),   # 深紫底
+        text_rgb=(255, 255, 255),     # 白字
+    ),
+    "面朝上": DefectVisStyle(
+        box_bgr=(0, 230, 255),        # 亮黄框（边框醒目）
+        label_bg_bgr=(35, 35, 35),    # 深灰底 — 不用黄底，避免白字难辨
+        text_rgb=(255, 228, 100),     # 浅黄字，深底上清晰
+    ),
+    "ERROR": DefectVisStyle(
+        box_bgr=(80, 80, 80),
+        label_bg_bgr=(40, 40, 40),
+        text_rgb=(255, 180, 180),
+    ),
+    "未分类": DefectVisStyle(
+        box_bgr=(160, 160, 160),
+        label_bg_bgr=(95, 95, 95),
+        text_rgb=(255, 255, 255),
+    ),
 }
+
+
+def _get_vis_style(defect_class: str) -> DefectVisStyle:
+    return DEFECT_VIS_STYLES.get(defect_class, _DEFAULT_VIS)
 
 # 纯检测可视化：所有框统一颜色（BGR 绿）
 DETECTION_ONLY_COLOR_BGR = (0, 255, 0)
@@ -463,9 +757,10 @@ def _draw_cjk_label(
     text: str,
     font,
     bg_bgr: Tuple[int, int, int],
+    text_rgb: Tuple[int, int, int],
     line_w: int,
 ) -> None:
-    """在 PIL ImageDraw 上绘制带背景的中文标签。"""
+    """在 PIL ImageDraw 上绘制带背景的中文标签（背景色与字体色独立配置）。"""
     bbox = draw.textbbox((x, y), text, font=font)
     pad = max(2, line_w // 2)
     bg_rgb = _bgr_to_rgb(bg_bgr)
@@ -473,7 +768,7 @@ def _draw_cjk_label(
         [bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad],
         fill=bg_rgb,
     )
-    draw.text((x, y), text, font=font, fill=(255, 255, 255))
+    draw.text((x, y), text, font=font, fill=text_rgb)
 
 
 def draw_detection_boxes(img: np.ndarray, dets: List[Detection]) -> np.ndarray:
@@ -507,11 +802,11 @@ def draw_classified_detections(img: np.ndarray, dets: List[Detection]) -> np.nda
     h, w = vis.shape[:2]
     line_w, font_size = _compute_vis_style(h, w)
 
-    labels: List[Tuple[int, int, str, Tuple[int, int, int]]] = []
+    labels: List[Tuple[int, int, str, DefectVisStyle]] = []
     for d in dets:
         x1, y1, x2, y2 = int(d.x1), int(d.y1), int(d.x2), int(d.y2)
-        color = DEFECT_COLORS.get(d.defect_class, (128, 128, 128))
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, line_w)
+        style = _get_vis_style(d.defect_class or "")
+        cv2.rectangle(vis, (x1, y1), (x2, y2), style.box_bgr, line_w)
 
         if d.defect_class and d.defect_class != "ERROR":
             label = f"{d.defect_class} {d.defect_conf:.2f}"
@@ -520,15 +815,18 @@ def draw_classified_detections(img: np.ndarray, dets: List[Detection]) -> np.nda
         else:
             label = f"检测 {d.conf:.2f}"
         ty = y1 - font_size - 6 if y1 > font_size + 10 else y2 + 4
-        labels.append((x1, ty, label, color))
+        labels.append((x1, ty, label, style))
 
     from PIL import Image, ImageDraw
 
     pil = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
     font = _resolve_cjk_font(font_size)
-    for tx, ty, text, color in labels:
-        _draw_cjk_label(draw, tx, ty, text, font, color, line_w)
+    for tx, ty, text, style in labels:
+        _draw_cjk_label(
+            draw, tx, ty, text, font,
+            style.label_bg_bgr, style.text_rgb, line_w,
+        )
 
     return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
@@ -601,19 +899,10 @@ class SahiPipeline:
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> dict:
         """
-        处理单张大图：检测 → 裁剪 → 分类 → 保存 → 统计。
+        处理单张大图：检测(+后处理) → 裁剪 → 分类 → 保存 → 统计。
 
         Returns:
-            统计字典:
-            {
-                "image": "xxx.jpg",
-                "total_diamonds": 42,
-                "defect_counts": {"局部破损": 10, "断钻": 5, ...},
-                "detection_time_s": 3.2,
-                "classification_time_s": 1.5,
-                "total_time_s": 4.7,
-                "output_dir": "output/xxx/",
-            }
+            统计字典（含 total_diamonds、defect_counts、各类 skipped、耗时与 output_dir）
         """
         def _log(msg: str):
             if log_cb:
@@ -647,15 +936,24 @@ class SahiPipeline:
              f"重叠 {self.detector.overlap_ratio:.0%}, 置信度 {self.detector.conf}")
         dets = self.detector.detect(img)
         det_time = time.time() - t0
-        _log(f"检测完成: {len(dets)} 个目标, 耗时 {det_time:.2f}s")
+        skip_stats = dict(self.detector.last_skip_stats)
+        skipped_total = sum(skip_stats.values())
+        if skipped_total:
+            _log(
+                f"后处理剔除: 包含冗余 {skip_stats.get('contained_skipped', 0)} · "
+                f"小面积 {skip_stats.get('small_skipped', 0)} · "
+                f"长宽比 {skip_stats.get('aspect_skipped', 0)} · "
+                f"边缘 {skip_stats.get('edge_skipped', 0)}"
+            )
+        _log(f"检测完成: 保留 {len(dets)} 个目标（剔除 {skipped_total}）, 耗时 {det_time:.2f}s")
 
         if progress_cb:
             progress_cb(1, 4)
 
         if not dets:
             _log("未检测到任何目标")
-            self._save_results(img_out_dir, stem, [], img, det_time, 0.0)
-            return self._stats(stem, [], det_time, 0.0, str(img_out_dir))
+            self._save_results(img_out_dir, stem, [], img, det_time, 0.0, skip_stats)
+            return self._stats(stem, [], det_time, 0.0, str(img_out_dir), skip_stats)
 
         if should_stop and should_stop():
             return self._empty_stats(stem)
@@ -703,9 +1001,9 @@ class SahiPipeline:
 
         # ── 5. 可视化 + 保存结果 ──────────────────────────────────
         _log("生成可视化与统计...")
-        self._save_results(img_out_dir, stem, dets, img, det_time, cls_time)
+        self._save_results(img_out_dir, stem, dets, img, det_time, cls_time, skip_stats)
 
-        stats = self._stats(stem, dets, det_time, cls_time, str(img_out_dir))
+        stats = self._stats(stem, dets, det_time, cls_time, str(img_out_dir), skip_stats)
         _log(f"统计: 钻石 {stats['total_diamonds']} 个 | "
              + " | ".join(f"{k}:{v}" for k, v in stats["defect_counts"].items())
              + f" | 总耗时 {stats['total_time_s']:.2f}s")
@@ -760,6 +1058,7 @@ class SahiPipeline:
         img: np.ndarray,
         det_time: float,
         cls_time: float,
+        skip_stats: Optional[Dict[str, int]] = None,
     ) -> None:
         """保存 result.json、statistics.json、两张全分辨率可视化图。"""
         det_vis, cls_vis = save_visualizations(out_dir, img, dets)
@@ -770,6 +1069,7 @@ class SahiPipeline:
             "detection_time_s": round(det_time, 3),
             "classification_time_s": round(cls_time, 3),
             "total_detections": len(dets),
+            "postprocess_skipped": dict(skip_stats or {}),
             "visualization_detection": det_vis,
             "visualization_classified": cls_vis,
             "detections": [d.to_dict() for d in dets],
@@ -777,7 +1077,7 @@ class SahiPipeline:
         with open(out_dir / "result.json", "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
-        stats = self._stats(stem, dets, det_time, cls_time, str(out_dir))
+        stats = self._stats(stem, dets, det_time, cls_time, str(out_dir), skip_stats)
         with open(out_dir / "statistics.json", "w", encoding="utf-8") as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
 
@@ -788,16 +1088,22 @@ class SahiPipeline:
         det_time: float,
         cls_time: float,
         out_dir: str,
+        skip_stats: Optional[Dict[str, int]] = None,
     ) -> dict:
         """构建统计字典。"""
         defect_counts: Dict[str, int] = {}
         for d in dets:
             cls = d.defect_class or "未分类"
             defect_counts[cls] = defect_counts.get(cls, 0) + 1
+        skip = skip_stats or {}
         return {
             "image": f"{stem}.jpg",
             "total_diamonds": len(dets),
             "defect_counts": defect_counts,
+            "contained_skipped": int(skip.get("contained_skipped", 0)),
+            "small_skipped": int(skip.get("small_skipped", 0)),
+            "aspect_skipped": int(skip.get("aspect_skipped", 0)),
+            "edge_skipped": int(skip.get("edge_skipped", 0)),
             "detection_time_s": round(det_time, 3),
             "classification_time_s": round(cls_time, 3),
             "total_time_s": round(det_time + cls_time, 3),
@@ -809,6 +1115,10 @@ class SahiPipeline:
             "image": f"{stem}.jpg",
             "total_diamonds": 0,
             "defect_counts": {},
+            "contained_skipped": 0,
+            "small_skipped": 0,
+            "aspect_skipped": 0,
+            "edge_skipped": 0,
             "detection_time_s": 0.0,
             "classification_time_s": 0.0,
             "total_time_s": 0.0,
@@ -821,13 +1131,21 @@ class SahiPipeline:
         csv_path = self.output_dir / "summary.csv"
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(["图像", "钻石数", "缺陷类别分布", "检测耗时(s)", "分类耗时(s)", "总耗时(s)"])
+            writer.writerow([
+                "图像", "钻石数", "缺陷类别分布",
+                "去包含冗余", "去小面积", "去长宽比", "去边缘",
+                "检测耗时(s)", "分类耗时(s)", "总耗时(s)",
+            ])
             for s in all_stats:
                 dist = " | ".join(f"{k}:{v}" for k, v in s.get("defect_counts", {}).items())
                 writer.writerow([
                     s.get("image", ""),
                     s.get("total_diamonds", 0),
                     dist,
+                    s.get("contained_skipped", 0),
+                    s.get("small_skipped", 0),
+                    s.get("aspect_skipped", 0),
+                    s.get("edge_skipped", 0),
                     s.get("detection_time_s", 0),
                     s.get("classification_time_s", 0),
                     s.get("total_time_s", 0),

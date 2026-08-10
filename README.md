@@ -21,6 +21,7 @@
 | **本文 (README.md)** | 环境、训练、应用功能、工作流 |
 | [打包部署说明.md](打包部署说明.md) | 机台 exe 打包、GPU 部署、故障排查 |
 | [QT应用开发说明.md](QT应用开发说明.md) | PyQt5 界面结构、信号槽、线程（改 UI 时阅读） |
+| [改进计划.md](改进计划.md) | SAHI 后处理已落地项与后续建议 |
 
 ---
 
@@ -39,15 +40,14 @@ defects_classify/
 ├── analyze_image_sizes.py    # 图像尺寸统计，推荐 img_size
 ├── requirements.txt          # 开发 / 训练依赖（含 ultralytics、opencv-python）
 ├── requirements-deploy.txt   # 机台打包专用依赖（无 PyTorch / SAHI）
-├── 缺陷分类系统.spec           # PyInstaller 规格参考（打包请以 build_deploy.py 为准）
-├── scripts/
-│   ├── build_deploy.py       # 机台打包主脚本（推荐）
-│   ├── build_deploy.bat      # 上述脚本 Windows 快捷方式
+├── scripts/                  # 打包与验收脚本（见下文「脚本索引」）
+│   ├── build_deploy.py       # 机台打包主脚本（唯一正式打包入口）
+│   ├── build_deploy.bat      # Windows 快捷方式
 │   ├── setup_deploy_env.ps1  # 创建 defects-deploy Conda 环境
-│   ├── verify_deploy.py      # 打包前 ORT + 模型验收
+│   ├── verify_deploy.py      # 打包前 ORT + 模型验收（源码环境）
 │   └── verify_frozen_sim.py  # 打包后 exe 验收（DEFECTS_VERIFY=1）
 ├── pyinstaller_hooks/
-│   └── rthook_ort_dll.py     # PyInstaller runtime hook（ORT / CUDA DLL）
+│   └── rthook_ort_dll.py     # 冻结进程最早配置 ORT/CUDA DLL（与 app_paths 双点）
 ├── checkpoints/              # 模型与配置（训练产出，纳入版本库）
 ├── data/                     # 训练数据（按类别分子文件夹，git 忽略）
 ├── corrections/              # 误分类修正归档（git 忽略）
@@ -81,6 +81,17 @@ conda activate defects-deploy
 ```
 
 详见 [打包部署说明.md](打包部署说明.md)。
+
+### 脚本索引（`scripts/`）
+
+| 脚本 | 用途 |
+|------|------|
+| `build_deploy.py` / `build_deploy.bat` | 正式机台打包（收集 CUDA DLL、PyInstaller、补丁 dist） |
+| `setup_deploy_env.ps1` | 创建/配置 `defects-deploy` Conda 环境 |
+| `verify_deploy.py` | 打包前：当前环境 ORT + `model.onnx` 加载 |
+| `verify_frozen_sim.py` | 打包后：对 `dist/缺陷分类系统/缺陷分类系统.exe` 设 `DEFECTS_VERIFY=1` |
+
+根目录已移除过时 `.spec`；**请勿**手写 PyInstaller 规格替代 `build_deploy.py`。
 
 ---
 
@@ -247,8 +258,8 @@ A: 覆盖机台 `checkpoints/` 下 `model.onnx`、`model.onnx.data`、`class_thr
 **Q: 训练路径找不到 data？**  
 A: `train.py` 会自动解析项目根目录，也可显式指定 `--data_dir`；确保 `data/` 下按类别分子文件夹。
 
-**Q: 直接用 `缺陷分类系统.spec` 打包？**  
-A: 不推荐。请使用 `python scripts/build_deploy.py`，它会动态收集 CUDA DLL、复制 checkpoints 并执行打包后补丁。
+**Q: 如何打包机台 exe？**  
+A: 使用 `python scripts/build_deploy.py`（或 `scripts\build_deploy.bat`）。脚本会动态收集 CUDA DLL、复制 checkpoints 并执行打包后补丁。不要依赖已删除的根目录 `.spec`。
 
 **Q: 机台 exe 能用钻石检测分类吗？**  
 A: 不能。SAHI / YOLO 依赖 ultralytics 与 PyTorch，仅 `python app.py` 开发版提供；机台 exe 仅含 ONNX 缺陷分类。

@@ -212,7 +212,7 @@ def run_batch_predict(
     通用批量推理循环（开发 PyTorch / 开发 ONNX 回退 / 机台 ONNX 共用）。
 
     infer_batch 须返回 float32 logits，形状 (N, num_classes)；
-    softmax 与阈值决策在 logits_row_to_result 内统一完成，避免重复或遗漏。
+    批量 softmax 后经 build_result_dict 做阈值决策，避免逐行重复 softmax。
     """
     total = len(image_paths)
     results: List[Optional[Dict]] = [None] * total
@@ -245,11 +245,12 @@ def run_batch_predict(
         logits = infer_batch(stack_batch(tensors))
         chunk_ms = (time.perf_counter() - t0) * 1000
         per_ms = chunk_ms / len(ok_indices)
+        scores = softmax_batch(np.asarray(logits))
 
         for j, idx in enumerate(ok_indices):
-            r = logits_row_to_result(
+            r = build_result_dict(
                 str(image_paths[idx]),
-                logits[j],
+                scores[j],
                 classes,
                 thr_vec,
                 elapsed_ms=per_ms,

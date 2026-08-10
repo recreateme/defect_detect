@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""通过真实 exe 验收 ORT + GPU（DEFECTS_VERIFY=1，不启动 GUI）。"""
+"""打包后验收：对 dist 下 exe 设 DEFECTS_VERIFY=1（无 GUI）。用法: python scripts/verify_frozen_sim.py"""
 
 from __future__ import annotations
 

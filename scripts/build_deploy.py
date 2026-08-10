@@ -3,6 +3,13 @@
 """
 机台 ONNX-GPU 精简打包（不含 PyTorch）。
 
+正式打包唯一入口（勿用根目录手写 .spec）：
+  1. 校验 checkpoints、切换 onnxruntime(-gpu)
+  2. 收集 nvidia CUDA pip DLL → build_staging/cuda_deps/
+  3. PyInstaller 打包 app_deploy.py，注入 pyinstaller_hooks/rthook_ort_dll.py
+  4. _patch_dist：补全 ORT 文件、去重 DLL、移除 TensorRT Provider
+  5. checkpoints 放到 exe 同级
+
 请在 defects-deploy 环境中运行:
   conda activate defects-deploy
   python scripts/build_deploy.py

@@ -105,22 +105,23 @@ except ImportError:
     _SAHI_DEPS_MSG = "sahi_detector 模块加载失败"
 
 # ═══════════════════════════════════════════════════════════
-# 常量 & 配置 — 持久化至 exe/项目根目录下的 app_config.json
+# 常量 & 配置 — 全部设置参数持久化至项目根目录 app_config.json
+# 启动时自动读取；文件缺失则使用下方代码默认值；设置页保存时重建文件
 # ═══════════════════════════════════════════════════════════
 APP_NAME = "钻石缺陷图像分类系统"
 APP_VER  = "v1.0" + (" · 机台版" if DEPLOY_ONNX_ONLY else "")
-CFG_FILE = app_dir() / "app_config.json"   # 可写；打包后位于 exe 同级
+CFG_FILE = app_dir() / "app_config.json"   # 可写；开发=项目根，打包后=exe 同级
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 TRAIN_SCRIPT = app_dir() / "train.py"      # RetrainPage 子进程入口
 
-# 开发版默认同时配置 .pt 与 .onnx；机台版仅 .onnx（pt_path 留空）
+# 开发版默认同时配置 .pt 与 .onnx；机台版由 FULL 派生后清空 pt_path。
+# 分类阈值见 checkpoints/class_thresholds.json，不在此配置全局置信度旋钮。
 _DEFAULT_CFG_FULL: Dict = {
     "pt_path":         "checkpoints/best_model.pt",
     "onnx_path":       "checkpoints/model.onnx",
     "data_dir":        "data",              # train.py --data_dir
     "corrections_dir": "corrections",       # 误分类归档根目录
     "use_gpu":         True,
-    "conf_threshold":  0.5,               # 持久化预留；推理阈值见 class_thresholds.json
     # ── SAHI 切片推理配置 ──────────────────────────────────────
     "yolo_path":          "",              # YOLO .pt 路径（在设置页配置）
     "sahi_device":        "auto",
@@ -130,24 +131,17 @@ _DEFAULT_CFG_FULL: Dict = {
     "sahi_batch_size":    8,
     "sahi_crop_padding":  15,
     "sahi_output_dir":    "sahi_output",
+    # ── SAHI 检测后处理（去误检 + 剔除边缘不完整目标）──────────────
+    "sahi_ios_thresh":       0.65,   # IoS 包含抑制阈值；<=0 关闭
+    "sahi_min_area_ratio":   0.45,   # 面积过滤：相对中位面积最小比例；<=0 关闭
+    "sahi_max_aspect_ratio": 2.5,    # 长宽比上限 max(w,h)/min(w,h)；<=0 关闭
+    "sahi_edge_filter":      True,   # 是否剔除边缘不完整钻石
+    "sahi_edge_margin_px":   20,     # 边缘边距（像素）；框触边距带内即剔除
 }
 
 _DEFAULT_CFG_DEPLOY: Dict = {
-    "pt_path":         "",                  # 机台不打包 PyTorch 权重
-    "onnx_path":       "checkpoints/model.onnx",
-    "data_dir":        "data",
-    "corrections_dir": "corrections",
-    "use_gpu":         True,
-    "conf_threshold":  0.5,
-    # ── SAHI 切片推理配置（机台版同样保留，但大图检测页不显示）─────
-    "yolo_path":          "",
-    "sahi_device":        "auto",
-    "sahi_slice_size":    1280,
-    "sahi_overlap":       0.20,
-    "sahi_det_conf":      0.35,
-    "sahi_batch_size":    8,
-    "sahi_crop_padding":  15,
-    "sahi_output_dir":    "sahi_output",
+    **_DEFAULT_CFG_FULL,
+    "pt_path": "",  # 机台不打包 PyTorch 权重；大图 SAHI 页不显示
 }
 
 
@@ -165,19 +159,60 @@ def _resolve_cfg_path(raw: str) -> str:
     return str(resolve_path(raw.strip()))
 
 
+def _migrate_cfg(loaded: Dict, base: Dict) -> Dict:
+    """旧配置字段迁移到当前 schema。"""
+    out = dict(loaded)
+    # 旧版「边缘边距比例」→ 像素（按 5120 短边估算）
+    if "sahi_edge_margin_px" not in out and "sahi_edge_margin_ratio" in out:
+        try:
+            out["sahi_edge_margin_px"] = max(
+                0, int(round(5120 * float(out["sahi_edge_margin_ratio"])))
+            )
+        except (TypeError, ValueError):
+            out["sahi_edge_margin_px"] = base.get("sahi_edge_margin_px", 20)
+    return out
+
+
 def _load_cfg() -> Dict:
-    """读取 app_config.json，缺失字段用 _default_cfg() 补全。"""
+    """
+    启动时读取项目根目录 app_config.json。
+    · 文件缺失 / 损坏 → 使用代码中的默认参数（不自动写盘）
+    · 文件存在 → 与默认合并（缺字段用默认补全，文件中的值优先）
+    """
     base = _default_cfg()
-    if CFG_FILE.exists():
+    if not CFG_FILE.exists():
+        return dict(base)
+    try:
         with open(CFG_FILE, "r", encoding="utf-8") as f:
-            return {**base, **json.load(f)}
-    return dict(base)
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            print(f"[配置] {CFG_FILE.name} 格式无效，已回退默认参数")
+            return dict(base)
+        loaded = _migrate_cfg(loaded, base)
+        merged = {**base, **loaded}
+        merged.pop("conf_threshold", None)  # 已废弃，忽略旧文件中的键
+        return merged
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[配置] 读取 {CFG_FILE} 失败（{exc}），已回退默认参数")
+        return dict(base)
 
 
 def _save_cfg(cfg: Dict):
-    """写入 app_config.json（UTF-8，中文不转义）。"""
+    """
+    写入项目根目录 app_config.json（UTF-8，中文不转义）。
+    始终以代码默认值为骨架补全全部已知键，文件不存在时重新创建。
+    """
+    base = _default_cfg()
+    # 已知键按默认顺序写出；额外键（若有）追加在后；丢弃已废弃键
+    cleaned = {k: v for k, v in cfg.items() if v is not None and k != "conf_threshold"}
+    merged = {**base, **cleaned}
+    ordered: Dict = {k: merged[k] for k in base.keys()}
+    for k, v in merged.items():
+        if k not in ordered:
+            ordered[k] = v
+    CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CFG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        json.dump(ordered, f, ensure_ascii=False, indent=2)
 
 
 # 模型再训练 / 设置页解除只读所需密码
@@ -301,6 +336,10 @@ class AppState:
         self.results: List[Dict] = []          # 进程内缓存，不自动落盘
         self.config:  Dict       = _load_cfg()
         self.admin_unlocked: bool = False
+        if CFG_FILE.exists():
+            print(f"[配置] 已加载: {CFG_FILE}")
+        else:
+            print(f"[配置] 未找到 {CFG_FILE.name}，使用代码默认参数；设置页保存后将创建该文件")
 
 
 def _verify_admin_password(parent: QWidget) -> bool:
@@ -497,6 +536,11 @@ class SahiPipelineWorker(QThread):
         det_conf: float = 0.35,
         batch_size: int = 8,
         crop_padding: int = 15,
+        ios_thresh: float = 0.65,
+        min_area_ratio: float = 0.45,
+        max_aspect_ratio: float = 2.5,
+        edge_filter: bool = True,
+        edge_margin_px: int = 20,
     ):
         super().__init__()
         self.yolo_path    = yolo_path
@@ -509,6 +553,11 @@ class SahiPipelineWorker(QThread):
         self.det_conf     = det_conf
         self.batch_size   = batch_size
         self.crop_padding = crop_padding
+        self.ios_thresh        = ios_thresh
+        self.min_area_ratio    = min_area_ratio
+        self.max_aspect_ratio  = max_aspect_ratio
+        self.edge_filter       = edge_filter
+        self.edge_margin_px    = edge_margin_px
         self.stop_flag    = False
 
     def run(self):
@@ -526,6 +575,11 @@ class SahiPipelineWorker(QThread):
             overlap_ratio=self.overlap,
             conf=self.det_conf,
             batch_size=self.batch_size,
+            ios_thresh=self.ios_thresh,
+            min_area_ratio=self.min_area_ratio,
+            max_aspect_ratio=self.max_aspect_ratio,
+            edge_filter=self.edge_filter,
+            edge_margin_px=self.edge_margin_px,
         )
         try:
             msg = detector.load()
@@ -966,6 +1020,26 @@ def _sep() -> QFrame:
     f.setFrameShape(QFrame.HLine)
     f.setStyleSheet("color:#E0E0E0;")
     return f
+
+
+def _tune_form_layout(fl: QFormLayout, label_min_width: int = 136) -> None:
+    """统一 FormLayout 行距与标签列宽，避免参数名/数值被截断。"""
+    fl.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    fl.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+    fl.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+    fl.setRowWrapPolicy(QFormLayout.DontWrapRows)
+    fl.setHorizontalSpacing(14)
+    fl.setVerticalSpacing(10)
+    for row in range(fl.rowCount()):
+        item = fl.itemAt(row, QFormLayout.LabelRole)
+        if item and item.widget():
+            item.widget().setMinimumWidth(label_min_width)
+
+
+def _tune_spinbox(sb: QWidget, min_width: int = 112) -> None:
+    """为数值控件设置最小宽度，保证完整显示。"""
+    sb.setMinimumWidth(min_width)
+    sb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
 
 def _normalize_image_path(path: str) -> str:
@@ -2984,12 +3058,12 @@ class SettingsPage(QWidget):
                 "若驱动/CUDA 不匹配将自动回退 CPU。"
             )
         ifl.addRow("加速设备:", self.chk_gpu)
-
-        self.sp_conf = QDoubleSpinBox()
-        self.sp_conf.setRange(0.0, 1.0)
-        self.sp_conf.setSingleStep(0.05)
-        self.sp_conf.setValue(self.state.config.get("conf_threshold", 0.5))
-        ifl.addRow("低置信度阈值:", self.sp_conf)
+        thr_hint = QLabel(
+            "逐类置信度阈值由 checkpoints/class_thresholds.json 提供（训练校准生成）。"
+        )
+        thr_hint.setWordWrap(True)
+        thr_hint.setStyleSheet("color:#78909C;font-size:11px;")
+        ifl.addRow("", thr_hint)
         cl.addWidget(infer_grp)
 
         # ── 保存按钮 ──────────────────────────────────────────────
@@ -3003,8 +3077,18 @@ class SettingsPage(QWidget):
 
         # ════════ Tab 2: 切片推理配置 ═════════════════════════════
         tab_sahi = QWidget()
-        sl = QVBoxLayout(tab_sahi)
+        tab_sahi_outer = QVBoxLayout(tab_sahi)
+        tab_sahi_outer.setContentsMargins(0, 0, 0, 0)
+
+        sahi_scroll = QScrollArea()
+        sahi_scroll.setWidgetResizable(True)
+        sahi_scroll.setFrameShape(QFrame.NoFrame)
+        sahi_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        sahi_content = QWidget()
+        sl = QVBoxLayout(sahi_content)
         sl.setSpacing(16)
+        sl.setContentsMargins(4, 4, 12, 4)
 
         if not _HAS_SAHI_DEPS:
             warn = QFrame()
@@ -3038,6 +3122,8 @@ class SettingsPage(QWidget):
 
         self.cmb_sahi_device = QComboBox()
         self.cmb_sahi_device.addItems(["auto", "cuda:0", "cpu"])
+        self.cmb_sahi_device.setMinimumWidth(112)
+        self.cmb_sahi_device.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         sah_dev = self.state.config.get("sahi_device", "auto")
         idx = self.cmb_sahi_device.findText(sah_dev)
         if idx >= 0:
@@ -3050,6 +3136,7 @@ class SettingsPage(QWidget):
         sahi_dev_hint.setWordWrap(True)
         sahi_dev_hint.setStyleSheet("color:#78909C;font-size:11px;")
         yl.addRow("", sahi_dev_hint)
+        _tune_form_layout(yl, 140)
         sl.addWidget(yolo_grp)
 
         # ── SAHI 切片参数 ─────────────────────────────────────────
@@ -3061,47 +3148,104 @@ class SettingsPage(QWidget):
         self.sp_slice.setRange(320, 4096)
         self.sp_slice.setSingleStep(128)
         self.sp_slice.setValue(self.state.config.get("sahi_slice_size", 1280))
+        _tune_spinbox(self.sp_slice)
         spl.addRow("切片大小 (px):", self.sp_slice)
 
         self.sp_overlap = QDoubleSpinBox()
         self.sp_overlap.setRange(0.0, 0.5)
         self.sp_overlap.setSingleStep(0.05)
+        self.sp_overlap.setDecimals(2)
         self.sp_overlap.setValue(self.state.config.get("sahi_overlap", 0.20))
+        _tune_spinbox(self.sp_overlap)
         spl.addRow("重叠率:", self.sp_overlap)
 
         self.sp_det_conf = QDoubleSpinBox()
         self.sp_det_conf.setRange(0.05, 0.95)
         self.sp_det_conf.setSingleStep(0.05)
+        self.sp_det_conf.setDecimals(2)
         self.sp_det_conf.setValue(self.state.config.get("sahi_det_conf", 0.35))
+        _tune_spinbox(self.sp_det_conf)
         spl.addRow("检测置信度:", self.sp_det_conf)
 
         self.sp_batch = QSpinBox()
         self.sp_batch.setRange(1, 64)
         self.sp_batch.setValue(self.state.config.get("sahi_batch_size", 8))
+        _tune_spinbox(self.sp_batch)
         spl.addRow("切片批大小:", self.sp_batch)
 
         self.sp_padding = QSpinBox()
         self.sp_padding.setRange(0, 100)
         self.sp_padding.setValue(self.state.config.get("sahi_crop_padding", 15))
+        _tune_spinbox(self.sp_padding)
         spl.addRow("裁剪边距 (px):", self.sp_padding)
+        _tune_form_layout(spl, 140)
         sl.addWidget(sahi_grp)
+
+        # ── 检测后处理（去误检 + 剔除边缘不完整目标）───────────────
+        post_grp = QGroupBox("检测后处理")
+        ppl = QFormLayout(post_grp)
+        ppl.setLabelAlignment(Qt.AlignRight)
+
+        self.sp_ios = QDoubleSpinBox()
+        self.sp_ios.setRange(0.0, 1.0)
+        self.sp_ios.setSingleStep(0.05)
+        self.sp_ios.setDecimals(2)
+        self.sp_ios.setValue(self.state.config.get("sahi_ios_thresh", 0.65))
+        self.sp_ios.setToolTip("交集/较小框面积 ≥ 此值判为包含冗余并去重；0 表示关闭")
+        _tune_spinbox(self.sp_ios)
+        ppl.addRow("IoS 包含抑制:", self.sp_ios)
+
+        self.sp_min_area = QDoubleSpinBox()
+        self.sp_min_area.setRange(0.0, 1.0)
+        self.sp_min_area.setSingleStep(0.05)
+        self.sp_min_area.setDecimals(2)
+        self.sp_min_area.setValue(self.state.config.get("sahi_min_area_ratio", 0.45))
+        self.sp_min_area.setToolTip("面积 < 本图中位面积 × 此比例的框判为误检；0 表示关闭")
+        _tune_spinbox(self.sp_min_area)
+        ppl.addRow("最小面积比例:", self.sp_min_area)
+
+        self.sp_max_aspect = QDoubleSpinBox()
+        self.sp_max_aspect.setRange(0.0, 20.0)
+        self.sp_max_aspect.setSingleStep(0.1)
+        self.sp_max_aspect.setDecimals(1)
+        self.sp_max_aspect.setValue(float(self.state.config.get("sahi_max_aspect_ratio", 2.5)))
+        self.sp_max_aspect.setToolTip(
+            "长宽比 = max(宽,高)/min(宽,高)；超过此值的细长框视为异常并剔除；0 表示关闭"
+        )
+        _tune_spinbox(self.sp_max_aspect)
+        ppl.addRow("最大长宽比:", self.sp_max_aspect)
+
+        self.chk_edge = QCheckBox("剔除图像边缘不完整钻石")
+        self.chk_edge.setChecked(bool(self.state.config.get("sahi_edge_filter", True)))
+        ppl.addRow("边缘剔除:", self.chk_edge)
+
+        self.sp_edge_margin = QSpinBox()
+        self.sp_edge_margin.setRange(0, 500)
+        self.sp_edge_margin.setSingleStep(1)
+        self.sp_edge_margin.setValue(int(self.state.config.get("sahi_edge_margin_px", 20)))
+        self.sp_edge_margin.setToolTip(
+            "距图像四边的像素边距带；检测框任一边落入该带内即视为边缘不完整目标并剔除"
+        )
+        _tune_spinbox(self.sp_edge_margin)
+        ppl.addRow("边缘边距 (px):", self.sp_edge_margin)
+        _tune_form_layout(ppl, 140)
+        sl.addWidget(post_grp)
 
         # ── 输出目录 ──────────────────────────────────────────────
         out_grp = QGroupBox("输出目录")
-        ol = QFormLayout(out_grp)
-        ol.setLabelAlignment(Qt.AlignRight)
+        ol = QHBoxLayout(out_grp)
+        ol.setSpacing(10)
         self.sahi_out_edit = QLineEdit(
             self.state.config.get("sahi_output_dir", "sahi_output")
         )
-        btn_sahi_out = _mk_btn("选择路径 …", "flat", 96)
+        btn_sahi_out = _mk_btn("选择路径", "flat", 96)
+        btn_sahi_out.setFixedHeight(34)
         btn_sahi_out.clicked.connect(
             lambda: self._browse_dir(self.sahi_out_edit, "SAHI 输出目录")
         )
-        sahi_out_row = QHBoxLayout()
-        sahi_out_row.addWidget(self.sahi_out_edit)
-        sahi_out_row.addWidget(btn_sahi_out)
+        ol.addWidget(self.sahi_out_edit, 1)
+        ol.addWidget(btn_sahi_out)
         self._sahi_browse_btns.append(btn_sahi_out)
-        ol.addRow("输出目录:", sahi_out_row)
         sl.addWidget(out_grp)
 
         # ── 保存按钮 ──────────────────────────────────────────────
@@ -3111,6 +3255,9 @@ class SettingsPage(QWidget):
         self.btn_sahi_save = btn_sahi_save
         sl.addWidget(btn_sahi_save)
         sl.addStretch()
+
+        sahi_scroll.setWidget(sahi_content)
+        tab_sahi_outer.addWidget(sahi_scroll)
         tabs.addTab(tab_sahi, "切片推理配置")
 
     def set_admin_locked(self, locked: bool) -> None:
@@ -3123,7 +3270,6 @@ class SettingsPage(QWidget):
         for btn in self._browse_btns:
             btn.setEnabled(not locked)
         self.chk_gpu.setEnabled(not locked)
-        self.sp_conf.setEnabled(not locked)
         self.btn_save.setEnabled(not locked)
         # Tab 2 控件
         self.yolo_edit.setReadOnly(locked)
@@ -3131,7 +3277,9 @@ class SettingsPage(QWidget):
         for btn in self._sahi_browse_btns:
             btn.setEnabled(not locked)
         for w in (self.sp_slice, self.sp_overlap, self.sp_det_conf,
-                  self.sp_batch, self.sp_padding, self.sahi_out_edit):
+                  self.sp_batch, self.sp_padding, self.sahi_out_edit,
+                  self.sp_ios, self.sp_min_area, self.sp_max_aspect,
+                  self.chk_edge, self.sp_edge_margin):
             w.setEnabled(not locked)
         self.btn_sahi_save.setEnabled(not locked)
 
@@ -3150,24 +3298,22 @@ class SettingsPage(QWidget):
             edit.setText(path)
 
     def _save_and_load(self):
-        """保存分类配置并热加载引擎。"""
+        """保存分类配置到根目录 app_config.json，并热加载引擎。"""
         if self._admin_locked:
             QMessageBox.warning(self, "只读模式", "请先输入密码解除只读后再保存设置。")
             return
-        cfg = {
+        # 以内存配置为底，更新本 Tab 字段；_save_cfg 会补全全部默认键并重建文件
+        cfg = dict(self.state.config)
+        cfg.update({
             "pt_path":         self.pt_edit.text().strip(),
             "onnx_path":       self.onnx_edit.text().strip(),
             "data_dir":        self.data_edit.text().strip(),
             "corrections_dir": self.corr_edit.text().strip(),
             "use_gpu":         self.chk_gpu.isChecked(),
-            "conf_threshold":  self.sp_conf.value(),
-        }
-        # 保留 SAHI 配置不变
-        for k in ("yolo_path", "sahi_device", "sahi_slice_size", "sahi_overlap",
-                   "sahi_det_conf", "sahi_batch_size", "sahi_crop_padding", "sahi_output_dir"):
-            cfg[k] = self.state.config.get(k)
+        })
+        cfg.pop("conf_threshold", None)  # 旧配置残留键，推理未使用
         _save_cfg(cfg)
-        self.state.config.update(cfg)
+        self.state.config = _load_cfg()  # 与落盘一致，并补全缺键
 
         if not self.state.engine:
             self.settings_saved.emit("推理引擎不可用（未安装 inference_engine）")
@@ -3186,11 +3332,11 @@ class SettingsPage(QWidget):
             self.settings_saved.emit(f"加载失败: {exc}")
 
     def _save_sahi(self):
-        """保存 SAHI 切片推理配置到 app_config.json（不涉及模型热加载）。"""
+        """保存 SAHI 切片推理配置到根目录 app_config.json（不涉及模型热加载）。"""
         if self._admin_locked:
             QMessageBox.warning(self, "只读模式", "请先输入密码解除只读后再保存设置。")
             return
-        cfg = dict(self.state.config)  # 保留现有
+        cfg = dict(self.state.config)
         cfg.update({
             "yolo_path":         self.yolo_edit.text().strip(),
             "sahi_device":       self.cmb_sahi_device.currentText(),
@@ -3200,10 +3346,15 @@ class SettingsPage(QWidget):
             "sahi_batch_size":   self.sp_batch.value(),
             "sahi_crop_padding": self.sp_padding.value(),
             "sahi_output_dir":   self.sahi_out_edit.text().strip(),
+            "sahi_ios_thresh":       self.sp_ios.value(),
+            "sahi_min_area_ratio":   self.sp_min_area.value(),
+            "sahi_max_aspect_ratio": self.sp_max_aspect.value(),
+            "sahi_edge_filter":      self.chk_edge.isChecked(),
+            "sahi_edge_margin_px":   self.sp_edge_margin.value(),
         })
         _save_cfg(cfg)
-        self.state.config.update(cfg)
-        self.settings_saved.emit("切片推理配置已保存")
+        self.state.config = _load_cfg()
+        self.settings_saved.emit(f"切片推理配置已保存 → {CFG_FILE.name}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -3234,6 +3385,7 @@ class DiamondDetectPage(QWidget):
         self.state = state
         self.worker: Optional[SahiPipelineWorker] = None
         self._img_paths: List[str] = []
+        self._input_folder: str = ""   # 文件夹模式下的根目录
         self._build()
 
     def _build(self):
@@ -3244,14 +3396,6 @@ class DiamondDetectPage(QWidget):
         title = QLabel("钻石检测分类")
         title.setStyleSheet("font-size:18px;font-weight:bold;color:#263238;")
         root.addWidget(title)
-
-        desc = QLabel(
-            "对 5120×5120 等大分辨率图像执行 SAHI 切片目标检测，"
-            "裁剪每个检测目标并送入缺陷分类引擎，输出每张图的钻石检测数与缺陷类别统计。\n"
-            "检测与切片推理参数请在「设置 → 切片推理配置」中调整。"
-        )
-        desc.setStyleSheet("color:#78909C;font-size:12px;")
-        root.addWidget(desc)
 
         # ── 依赖检查提示 ──────────────────────────────────────────
         if not _HAS_SAHI_DEPS:
@@ -3267,52 +3411,59 @@ class DiamondDetectPage(QWidget):
             wl.addWidget(lbl)
             root.addWidget(warn)
 
-        # ── 输入图像 ──────────────────────────────────────────────
+        # ── 输入图像（左 8 : 右 2 — 路径展示 / 选择按钮）────────────
         input_grp = QGroupBox("输入图像")
         il = QVBoxLayout(input_grp)
-        il.setSpacing(8)
+        il.setSpacing(6)
 
-        self.file_list = QListWidget()
-        self.file_list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.file_list.setMinimumHeight(80)
-        self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.file_list.setStyleSheet("QListWidget{font-size:14px;color:#37474F;}")
-        il.addWidget(self.file_list, 1)
+        input_split = QHBoxLayout()
+        input_split.setSpacing(12)
 
-        input_btn_row = QHBoxLayout()
-        input_btn_row.addStretch()
+        # 左侧 80%：已选文件夹或文件来源路径
+        self.lbl_input_path = QLabel("未选择图像")
+        self.lbl_input_path.setWordWrap(True)
+        self.lbl_input_path.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.lbl_input_path.setMinimumHeight(72)
+        self.lbl_input_path.setStyleSheet(
+            "color:#37474F;font-size:16px;font-weight:500;padding:4px 2px;"
+        )
+        input_split.addWidget(self.lbl_input_path, 8)
+
+        # 右侧 20%：选择按钮（纵向排列）
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(8)
         btn_files = _mk_btn("选择文件", "flat")
-        btn_files.setMinimumWidth(100)
+        btn_files.setMinimumHeight(34)
         btn_files.clicked.connect(self._browse_files)
         btn_folder = _mk_btn("选择文件夹", "flat")
-        btn_folder.setMinimumWidth(112)
+        btn_folder.setMinimumHeight(34)
         btn_folder.clicked.connect(self._browse_folder)
-        input_btn_row.addWidget(btn_files)
-        input_btn_row.addWidget(btn_folder)
-        il.addLayout(input_btn_row)
+        btn_col.addWidget(btn_files)
+        btn_col.addWidget(btn_folder)
+        btn_col.addStretch()
+        input_split.addLayout(btn_col, 2)
+        il.addLayout(input_split)
 
-        self.lbl_img_count = QLabel("未选择图像")
+        self.lbl_img_count = QLabel("")
         self.lbl_img_count.setStyleSheet("color:#546E7A;font-size:12px;")
         il.addWidget(self.lbl_img_count)
         root.addWidget(input_grp)
 
-        # ── 结果保存目录 ──────────────────────────────────────────
+        # ── 结果保存目录（路径与按钮同一行）─────────────────────────
         out_grp = QGroupBox("结果保存目录")
-        ol = QVBoxLayout(out_grp)
-        ol.setSpacing(8)
+        ol = QHBoxLayout(out_grp)
+        ol.setSpacing(10)
         self.out_edit = QLineEdit()
         self.out_edit.setPlaceholderText("选择保存目录...")
         self.out_edit.setText(
             str(resolve_path(self.state.config.get("sahi_output_dir", "sahi_output")))
         )
-        ol.addWidget(self.out_edit)
-        out_btn_row = QHBoxLayout()
-        out_btn_row.addStretch()
+        ol.addWidget(self.out_edit, 1)
         btn_out = _mk_btn("选择目录", "flat")
-        btn_out.setMinimumWidth(100)
+        btn_out.setMinimumWidth(96)
+        btn_out.setFixedHeight(34)
         btn_out.clicked.connect(self._browse_output)
-        out_btn_row.addWidget(btn_out)
-        ol.addLayout(out_btn_row)
+        ol.addWidget(btn_out)
         root.addWidget(out_grp)
 
         # ── 控制按钮 + 进度条 ─────────────────────────────────────
@@ -3369,19 +3520,37 @@ class DiamondDetectPage(QWidget):
         self._btn_out = btn_out
 
         if not _HAS_SAHI_DEPS:
-            for w in (btn_files, btn_folder, btn_out, self.btn_run, self.out_edit, self.file_list):
+            for w in (btn_files, btn_folder, btn_out, self.btn_run, self.out_edit):
                 w.setEnabled(False)
 
     def _update_file_display(self):
-        """刷新已选图像列表，显示每个文件的完整路径。"""
-        self.file_list.clear()
-        for p in self._img_paths:
-            full = str(Path(p).resolve())
-            item = QListWidgetItem(full)
-            item.setToolTip(full)
-            self.file_list.addItem(item)
+        """刷新左侧路径展示与图像计数。"""
         n = len(self._img_paths)
-        self.lbl_img_count.setText(f"共 {n} 张图像" if n else "未选择图像")
+        if not n:
+            self.lbl_input_path.setText("未选择图像")
+            self.lbl_input_path.setToolTip("")
+            self.lbl_img_count.setText("")
+            return
+
+        if self._input_folder:
+            folder = str(Path(self._input_folder).resolve())
+            self.lbl_input_path.setText(folder)
+            self.lbl_input_path.setToolTip(folder)
+        else:
+            parents = {str(Path(p).resolve().parent) for p in self._img_paths}
+            if len(parents) == 1:
+                folder = next(iter(parents))
+                self.lbl_input_path.setText(folder)
+                self.lbl_input_path.setToolTip(
+                    "\n".join(str(Path(p).resolve()) for p in self._img_paths[:20])
+                    + (f"\n... 共 {n} 个文件" if n > 20 else "")
+                )
+            else:
+                self.lbl_input_path.setText(f"已选 {n} 个文件（多个来源文件夹）")
+                self.lbl_input_path.setToolTip(
+                    "\n".join(str(Path(p).resolve()) for p in self._img_paths[:30])
+                )
+        self.lbl_img_count.setText(f"共 {n} 张图像")
 
     # ── 浏览按钮 ──────────────────────────────────────────────────
 
@@ -3391,6 +3560,7 @@ class DiamondDetectPage(QWidget):
         )
         if paths:
             self._img_paths = [str(p) for p in paths]
+            self._input_folder = ""
             self._update_file_display()
 
     def _browse_folder(self):
@@ -3401,6 +3571,7 @@ class DiamondDetectPage(QWidget):
                 if f.suffix.lower() in IMG_EXTS
             )
             self._img_paths = imgs
+            self._input_folder = folder
             self._update_file_display()
 
     def _browse_output(self):
@@ -3454,6 +3625,11 @@ class DiamondDetectPage(QWidget):
             det_conf=cfg.get("sahi_det_conf", 0.35),
             batch_size=cfg.get("sahi_batch_size", 8),
             crop_padding=cfg.get("sahi_crop_padding", 15),
+            ios_thresh=cfg.get("sahi_ios_thresh", 0.65),
+            min_area_ratio=cfg.get("sahi_min_area_ratio", 0.45),
+            max_aspect_ratio=cfg.get("sahi_max_aspect_ratio", 2.5),
+            edge_filter=cfg.get("sahi_edge_filter", True),
+            edge_margin_px=cfg.get("sahi_edge_margin_px", 20),
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.image_done.connect(self._on_image_done)

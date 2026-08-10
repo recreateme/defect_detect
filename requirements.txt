@@ -1,23 +1,31 @@
-# 核心依赖（CPU 和 GPU 通用）
+# 钻石缺陷图像分类系统 — 依赖
+
+# 训练 / 开发 GUI / 数据分析
 torch>=1.11.0
 torchvision>=0.12.0
 Pillow>=9.0.0
 numpy>=1.21.0
 pandas>=1.3.0
 matplotlib>=3.4.0
-scikit-learn>=1.0.0   # 混淆矩阵 & 分类报告（可选，缺失时跳过）
+scikit-learn>=1.0.0
 
 # PyQt5 GUI
 PyQt5>=5.15.0
 
-# CPU 推理加速（可选，无此包则退回 PyTorch CPU）
+# 开发版钻石检测分类（SAHI / YOLO；机台 exe 不含）
+ultralytics>=8.0.0
+opencv-python>=4.5.0
+
+# CPU 推理加速（可选；无此包则开发版退回 PyTorch CPU）
 onnx>=1.12.0
 onnxruntime>=1.12.0
 
-# 安装示例（纯 CPU 机台）:
+# 安装示例（纯 CPU 开发机）:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-#   pip install Pillow numpy pandas matplotlib scikit-learn PyQt5 onnx onnxruntime
+#   pip install -r requirements.txt
 #
-# 安装示例（GPU CUDA 11.8 机台）:
+# 安装示例（GPU CUDA 11.8）:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-#   pip install Pillow numpy pandas matplotlib scikit-learn PyQt5 onnx onnxruntime
+#   pip install -r requirements.txt
+#
+# 机台打包请用 requirements-deploy.txt + scripts/setup_deploy_env.ps1（勿与本文件混用）。

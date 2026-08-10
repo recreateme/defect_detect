@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 机台部署入口：PyInstaller 打包此文件，仅含 ONNX 推理依赖（不含 PyTorch）。
+
+环境变量:
+  DEFECTS_DEPLOY=1   — 由本文件设置；app.py 据此选用 inference_engine_onnx、隐藏 SAHI 等
+  DEFECTS_VERIFY=1   — 无 GUI 验收：测 ORT 导入 + model.onnx 加载后按码退出（见 _verify_and_exit）
+
 开发调试: python app_deploy.py
 验收模式: set DEFECTS_VERIFY=1 && 缺陷分类系统.exe
 """

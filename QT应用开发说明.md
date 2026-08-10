@@ -432,23 +432,25 @@ QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
 ---
 
-## 13. 源码索引（app.py，约 3800 行）
+## 13. 源码索引（`app.py`，按符号）
 
-| 行号区间（约） | 内容 |
-|----------------|------|
-| 1–110 | 模块说明、`DEPLOY_ONNX_ONLY`、`NAV_*`、SAHI 依赖检查 |
-| 111–210 | 常量、`app_config.json` 读写、全局 QSS |
-| 211–290 | AppState、AdminLockBar、密码验证 |
-| 291–470 | InferenceWorker、TrainWorker、**SahiPipelineWorker** |
-| 471–1000 | ImageDropZone、缩略图、SidePreviewController、预览侧栏 |
-| 1001–1320 | DetectionPage |
-| 1321–1830 | ResultsPage |
-| 1831–2340 | CorrectionPage |
-| 2341–2570 | RetrainPage |
-| 2571–3210 | SettingsPage（分类配置 + 切片推理配置 Tab） |
-| 3211–3530 | **DiamondDetectPage** |
-| 3531–3785 | MainWindow |
-| 3786–3800 | `main()`、`freeze_support` |
+| 符号 / 区域 | 内容 |
+|-------------|------|
+| 模块头、`DEPLOY_ONNX_ONLY`、`NAV_*` | 机台开关、导航、SAHI 依赖检查 |
+| `_DEFAULT_CFG_FULL` / `_load_cfg` / `_save_cfg` | 默认配置与 `app_config.json` |
+| `STYLE` | 全局 QSS |
+| `AppState`、`AdminLockBar` | 共享状态、管理员解锁条 |
+| `InferenceWorker`、`TrainWorker`、`SahiPipelineWorker` | 后台线程 |
+| `ImageDropZone`、缩略图、侧栏预览 | 通用 UI 组件 |
+| `DetectionPage` | 单张 / 批量缺陷检测 |
+| `ResultsPage` | 结果管理 |
+| `CorrectionPage` | 误分类修正 |
+| `RetrainPage` | 模型再训练（机台只读） |
+| `SettingsPage` | 分类配置 + 切片推理配置 Tab（阈值见 `class_thresholds.json`） |
+| `DiamondDetectPage` | 钻石检测分类（仅开发版） |
+| `MainWindow`、`main()` | 窗口组装与入口（含 `freeze_support`） |
+
+在 IDE 中用「转到定义」定位上述类/函数即可，勿依赖易漂移的行号。
 
 ---
 

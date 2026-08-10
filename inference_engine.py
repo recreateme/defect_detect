@@ -3,6 +3,8 @@
 """
 开发环境推理引擎 — PyTorch GPU 优先，ONNX CPU 回退。
 
+由 python app.py 默认选用；机台版见 inference_engine_onnx.py（仅 ORT）。
+
 性能要点：
   · PyTorch 路径：GPU 上批量 forward，减少 kernel 启动次数
   · ONNX 回退：与机台版共用 inference_common.run_batch_predict
@@ -26,7 +28,6 @@ from PIL import Image
 from inference_common import (
     build_threshold_vector,
     logits_row_to_result,
-    make_error_result,
     read_class_thresholds,
     read_model_meta,
     run_batch_predict,
@@ -254,5 +255,3 @@ class InferenceEngine:
                 nn.Linear(in_f, num_classes),
             )
         return m
-
-    _error_result = staticmethod(make_error_result)

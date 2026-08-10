@@ -3,6 +3,9 @@
 """
 机台部署专用推理引擎（ONNX Runtime + NumPy + Pillow，不依赖 PyTorch）。
 
+由 app_deploy / DEFECTS_DEPLOY=1 选用；开发版见 inference_engine.py（PyTorch 优先）。
+DLL 搜索统一走 app_paths.setup_ort_dll_paths()（冻结环境另有 rthook 最早兜底）。
+
 性能要点：
   · Session 图优化 (ORT_ENABLE_ALL)
   · 批量推理：多张图一次 session.run，显著降低 GPU 启动开销
@@ -41,19 +44,15 @@ _DEFAULT_BATCH_CPU = 8
 
 
 def _ensure_ort_import() -> bool:
-    """延迟加载 onnxruntime，并在 import 前配置 DLL 路径（Windows 打包必需）。"""
+    """延迟加载 onnxruntime；import 前只调用 setup_ort_dll_paths（含 preload）。"""
     global ort, HAS_ORT, _ORT_IMPORT_ERROR
     if HAS_ORT and ort is not None:
         return True
     if _ORT_IMPORT_ERROR:
         return False
     try:
-        from app_paths import setup_ort_dll_paths, ort_native_dirs, _preload_ort_core_dlls
+        from app_paths import setup_ort_dll_paths
         setup_ort_dll_paths()
-        for d in ort_native_dirs():
-            if d.name == "capi" and d.parent.name == "onnxruntime":
-                _preload_ort_core_dlls(d)
-                break
     except ImportError:
         pass
     try:
