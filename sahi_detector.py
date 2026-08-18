@@ -14,7 +14,7 @@ Slicing Aided Hyper Inference (SAHI) 大图检测 + 缺陷分类流水线
 本模块针对**单张大图**简化：无需网格坐标、跨图 NMS。
 
 依赖:
-  - ultralytics  (YOLO 推理，**仅开发环境**)
+  - ultralytics  (YOLO 推理；开发版与机台 exe 均需要)
   - opencv-python (图像 I/O 与可视化)
   - numpy
 
@@ -48,8 +48,9 @@ class Detection:
     """
     单个检测框（原图坐标系）。
 
-    检测阶段填充 x1/y1/x2/y2/conf；
-    分类阶段填充 defect_class / defect_conf / all_scores。
+    检测阶段填充 x1/y1/x2/y2/conf（YOLO det_conf）与 cls_name（YOLO 类名，通常非缺陷五类）。
+    分类阶段由缺陷分类引擎填充 defect_* / max_* / all_scores，
+    字段语义与 inference_common.build_result_dict 一致。
     """
     x1: float
     y1: float
@@ -58,9 +59,11 @@ class Detection:
     conf: float
     cls_id: int = 0
     cls_name: str = ""
-    # ── 分类结果（SahiPipeline.process_image 中填充）──────────────
+    # ── 分类结果（与 DetectionPage / inference_common 同一套键）────
     defect_class: str = ""
-    defect_conf: float = 0.0
+    defect_conf: float = 0.0          # 阈值决策后的预测类概率 (= confidence)
+    max_class: str = ""               # argmax 最高分类别
+    max_confidence: float = 0.0       # argmax 概率
     all_scores: Dict[str, float] = field(default_factory=dict)
     crop_path: str = ""
 
@@ -73,6 +76,62 @@ class Detection:
     @property
     def h(self) -> float: return self.y2 - self.y1
 
+    def apply_classifier_result(
+        self,
+        result: Dict[str, Any],
+        known_classes: Optional[List[str]] = None,
+    ) -> None:
+        """
+        将 InferenceEngine 的统一结果 dict 写入本检测框。
+        仅接受 known_classes（缺陷五类）中的类别名，避免与 YOLO cls_name 混淆。
+
+        字段说明（与 inference_common 一致）:
+          · defect_class / defect_conf — 经 class_thresholds 决策后的预测类
+          · max_class / max_confidence — softmax 最高分（纯 argmax，可视化默认用这个）
+        """
+        cls = str(result.get("class", "ERROR") or "ERROR")
+        if known_classes and cls not in known_classes and cls != "ERROR":
+            logger.warning(
+                "分类结果类别 %r 不在引擎类别 %s 中，标记为 ERROR",
+                cls, known_classes,
+            )
+            self.defect_class = "ERROR"
+            self.defect_conf = 0.0
+            self.max_class = str(result.get("max_class", "") or "")
+            self.max_confidence = float(result.get("max_confidence", 0.0) or 0.0)
+            self.all_scores = dict(result.get("all_scores") or {})
+            return
+
+        self.defect_class = cls
+        self.defect_conf = float(result.get("confidence", 0.0) or 0.0)
+        self.max_class = str(result.get("max_class", cls) or cls)
+        self.max_confidence = float(
+            result.get("max_confidence", self.defect_conf) or self.defect_conf
+        )
+        scores = result.get("all_scores") or {}
+        if known_classes:
+            self.all_scores = {
+                c: float(scores.get(c, 0.0)) for c in known_classes
+            }
+        else:
+            self.all_scores = {str(k): float(v) for k, v in scores.items()}
+
+    @property
+    def display_class(self) -> str:
+        """可视化 / 裁剪命名 / 统计默认：模型最高分对应类别。"""
+        if self.defect_class == "ERROR":
+            return "ERROR"
+        return self.max_class or self.defect_class
+
+    @property
+    def display_conf(self) -> float:
+        """与 display_class 配套的置信度（argmax 概率）。"""
+        if self.defect_class == "ERROR":
+            return self.defect_conf
+        if self.max_class:
+            return self.max_confidence
+        return self.defect_conf
+
     def to_dict(self) -> dict:
         return {
             "x1": round(self.x1, 1), "y1": round(self.y1, 1),
@@ -80,8 +139,12 @@ class Detection:
             "cx": round(self.cx, 1),  "cy": round(self.cy, 1),
             "w":  round(self.w, 1),   "h":  round(self.h, 1),
             "det_conf": round(self.conf, 4),
+            "yolo_cls": self.cls_name,
             "defect_class": self.defect_class,
             "defect_conf": round(self.defect_conf, 4),
+            "max_class": self.max_class,
+            "max_confidence": round(self.max_confidence, 4),
+            "all_scores": {k: round(v, 4) for k, v in self.all_scores.items()},
             "crop_path": self.crop_path,
         }
 
@@ -207,13 +270,14 @@ def _pairwise_ios(dets: List[Detection]) -> np.ndarray:
 
 def suppress_contained_boxes(
     dets: List[Detection],
-    ios_thresh: float = 0.65,
+    ios_thresh: float = 0.60,
 ) -> Tuple[List[Detection], List[Detection]]:
     """
     IoS 包含抑制 — 去除「被另一框大部分包含」的冗余小框。
 
-    对任意两框，若 IoS >= ios_thresh，判为包含型冗余，丢弃其中
-    置信度较低者（置信度相同则丢弃面积较小者）。
+    对任意两框，若 IoS >= ios_thresh，判为包含型冗余。
+    默认丢弃面积较小者（大套小场景下小框多为误检）；
+    面积接近时再比较置信度。
 
     Returns:
         (保留列表, 被剔除列表)
@@ -234,10 +298,13 @@ def suppress_contained_boxes(
                 continue
             if ios[i, j] < ios_thresh:
                 continue
-            # 保留置信度高者；置信度相等保留面积大者
-            if dets[i].conf > dets[j].conf or (
-                dets[i].conf == dets[j].conf and areas[i] >= areas[j]
-            ):
+            # 保大框：面积明显更大者保留；接近时保留置信度更高者
+            if areas[i] > areas[j] * 1.05:
+                removed[j] = True
+            elif areas[j] > areas[i] * 1.05:
+                removed[i] = True
+                break
+            elif dets[i].conf >= dets[j].conf:
                 removed[j] = True
             else:
                 removed[i] = True
@@ -284,13 +351,14 @@ def filter_small_area(
 
 def filter_aspect_ratio(
     dets: List[Detection],
-    max_aspect_ratio: float = 2.5,
+    max_aspect_ratio: float = 1.5,
 ) -> Tuple[List[Detection], List[Detection]]:
     """
     长宽比过滤 — 剔除过于细长的异常检测框。
 
     长宽比 = max(w, h) / min(w, h)（恒 ≥ 1）。钻石目标应接近正方形，
     比例过大常见于切片边界截断或粘连误检。max_aspect_ratio <= 0 时关闭。
+    默认 1.5：钻石近正方形，超过 1.5 视为异常剔除。
 
     Returns:
         (保留列表, 被剔除列表)
@@ -439,7 +507,7 @@ class SahiDetector:
         nms_iou:         IoU-NMS 阈值（重叠去重）
 
     后处理（检测后串联，去误检 + 剔除边缘不完整目标）:
-        ios_thresh:        IoS 包含抑制阈值；<=0 或 >=1 关闭
+        ios_thresh:        IoS 包含抑制阈值（默认 0.60）；<=0 或 >=1 关闭；冲突保大框
         min_area_ratio:    面积过滤：相对本图中位面积的最小比例；<=0 关闭
         min_abs_area:      面积绝对下限（像素²，可选）
         max_aspect_ratio:  长宽比上限 max(w,h)/min(w,h)；<=0 关闭
@@ -457,10 +525,10 @@ class SahiDetector:
         conf: float = 0.35,
         batch_size: int = 8,
         nms_iou: float = 0.50,
-        ios_thresh: float = 0.65,
+        ios_thresh: float = 0.60,
         min_area_ratio: float = 0.45,
         min_abs_area: Optional[float] = None,
-        max_aspect_ratio: float = 2.5,
+        max_aspect_ratio: float = 1.5,
         edge_filter: bool = True,
         edge_margin_px: float = 20,
         drop_touching: bool = True,
@@ -793,6 +861,9 @@ def draw_classified_detections(img: np.ndarray, dets: List[Detection]) -> np.nda
     """
     全分辨率分类可视化 — 按缺陷类别着色，PIL 绘制中文类别名。
 
+    标签展示 softmax 最高分类别及其概率（与「模型最可能是谁」一致）。
+    class_thresholds 决策结果仍写入 result.json（defect_class），不画在图上以免误解。
+
     OpenCV putText 不支持中文，故框用 cv2 绘制、文字用 PIL + 系统中文字体。
     """
     vis = img.copy()
@@ -805,15 +876,16 @@ def draw_classified_detections(img: np.ndarray, dets: List[Detection]) -> np.nda
     labels: List[Tuple[int, int, str, DefectVisStyle]] = []
     for d in dets:
         x1, y1, x2, y2 = int(d.x1), int(d.y1), int(d.x2), int(d.y2)
-        style = _get_vis_style(d.defect_class or "")
+        vis_cls = d.display_class
+        style = _get_vis_style(vis_cls or "")
         cv2.rectangle(vis, (x1, y1), (x2, y2), style.box_bgr, line_w)
 
-        if d.defect_class and d.defect_class != "ERROR":
-            label = f"{d.defect_class} {d.defect_conf:.2f}"
-        elif d.defect_class == "ERROR":
-            label = f"分类失败 {d.defect_conf:.2f}"
+        if vis_cls and vis_cls != "ERROR":
+            label = f"{vis_cls} {d.display_conf:.2f}"
+        elif vis_cls == "ERROR":
+            label = "分类失败"
         else:
-            label = f"检测 {d.conf:.2f}"
+            label = f"未分类 det={d.conf:.2f}"
         ty = y1 - font_size - 6 if y1 > font_size + 10 else y2 + 4
         labels.append((x1, ty, label, style))
 
@@ -897,9 +969,13 @@ class SahiPipeline:
         progress_cb: Optional[Callable[[int, int], None]] = None,
         log_cb: Optional[Callable[[str], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        stage_cb: Optional[Callable[[str], None]] = None,
     ) -> dict:
         """
         处理单张大图：检测(+后处理) → 裁剪 → 分类 → 保存 → 统计。
+
+        progress_cb(current, total)：阶段进度（0~4）。
+        stage_cb(msg)：当前阶段文案（供 UI 状态栏）。
 
         Returns:
             统计字典（含 total_diamonds、defect_counts、各类 skipped、耗时与 output_dir）
@@ -909,6 +985,12 @@ class SahiPipeline:
                 log_cb(msg)
             else:
                 logger.info(msg)
+
+        def _stage(msg: str, step: int) -> None:
+            if stage_cb:
+                stage_cb(msg)
+            if progress_cb:
+                progress_cb(step, 4)
 
         path = Path(img_path)
         stem = path.stem
@@ -920,6 +1002,7 @@ class SahiPipeline:
             return self._empty_stats(stem)
 
         # ── 1. 读取大图 ──────────────────────────────────────────
+        _stage(f"读取 {path.name}", 0)
         _log(f"读取图像: {path.name}")
         img = cv2.imread(str(path))
         if img is None:
@@ -927,10 +1010,8 @@ class SahiPipeline:
         H, W = img.shape[:2]
         _log(f"图像尺寸: {W}×{H}")
 
-        if progress_cb:
-            progress_cb(0, 4)
-
         # ── 2. SAHI 检测 ──────────────────────────────────────────
+        _stage(f"检测 {path.name}", 1)
         t0 = time.time()
         _log(f"SAHI 检测: 切片 {self.detector.slice_size}px, "
              f"重叠 {self.detector.overlap_ratio:.0%}, 置信度 {self.detector.conf}")
@@ -947,57 +1028,95 @@ class SahiPipeline:
             )
         _log(f"检测完成: 保留 {len(dets)} 个目标（剔除 {skipped_total}）, 耗时 {det_time:.2f}s")
 
-        if progress_cb:
-            progress_cb(1, 4)
-
         if not dets:
             _log("未检测到任何目标")
             self._save_results(img_out_dir, stem, [], img, det_time, 0.0, skip_stats)
+            _stage(f"完成 {path.name}", 4)
             return self._stats(stem, [], det_time, 0.0, str(img_out_dir), skip_stats)
 
         if should_stop and should_stop():
             return self._empty_stats(stem)
 
-        # ── 3. 裁剪 + 保存裁剪图 ──────────────────────────────────
-        _log(f"裁剪 {len(dets)} 个目标...")
-        crop_paths: List[str] = []
-        for i, d in enumerate(dets):
+        # ── 3. 裁剪（内存）──────────────────────────────────────
+        _stage(f"裁剪 {len(dets)} 个目标", 2)
+        _log(f"裁剪 {len(dets)} 个目标（内存分类，写盘一次）...")
+        crop_bgr: List[np.ndarray] = []
+        for d in dets:
             if should_stop and should_stop():
                 return self._empty_stats(stem)
-            crop = crop_with_padding(img, d.x1, d.y1, d.x2, d.y2, self.crop_padding)
-            crop_path = str(crops_dir / f"{i + 1:04d}.jpg")
-            cv2.imwrite(crop_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            crop_paths.append(crop_path)
-            d.crop_path = crop_path
+            crop_bgr.append(
+                crop_with_padding(img, d.x1, d.y1, d.x2, d.y2, self.crop_padding)
+            )
 
-        if progress_cb:
-            progress_cb(2, 4)
+        # ── 4. 批量分类（与缺陷检测页共用同一 InferenceEngine / 阈值逻辑）──
+        _stage(f"分类 {len(dets)} 个目标", 3)
+        known_classes = list(getattr(self.classifier, "classes", None) or [])
+        if not known_classes:
+            raise RuntimeError(
+                "分类引擎未加载类别列表。请先在「设置 → 分类配置」加载 "
+                "checkpoints 下的缺陷分类模型（与单张检测同一引擎）。"
+            )
+        thr_info = getattr(self.classifier, "class_thresholds", None) or {}
+        _log(
+            f"分类引擎: {len(known_classes)} 类 {known_classes} · "
+            f"img_size={getattr(self.classifier, 'img_size', '?')} · "
+            f"backend={getattr(self.classifier, 'backend', '?')} · "
+            f"阈值={'是' if thr_info else '否(纯argmax)'}"
+        )
 
-        # ── 4. 批量分类 ───────────────────────────────────────────
         t1 = time.time()
-        _log(f"批量分类 {len(crop_paths)} 个裁剪图...")
-        cls_results = self.classifier.predict_batch(crop_paths)
+        predict_images = getattr(self.classifier, "predict_batch_images", None)
+        if callable(predict_images):
+            from PIL import Image as _PILImage
+            crop_pils = [
+                _PILImage.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB))
+                for c in crop_bgr
+            ]
+            _log(f"批量分类 {len(crop_pils)} 个裁剪图（内存，与 predict_batch 同预处理/阈值）...")
+            cls_results = predict_images(
+                crop_pils,
+                should_stop=should_stop,
+            )
+        else:
+            crop_paths: List[str] = []
+            for i, crop in enumerate(crop_bgr):
+                crop_path = str(crops_dir / f"{i + 1:04d}.jpg")
+                cv2.imwrite(crop_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                crop_paths.append(crop_path)
+                dets[i].crop_path = crop_path
+            _log(f"批量分类 {len(crop_paths)} 个裁剪图（磁盘回退）...")
+            cls_results = self.classifier.predict_batch(
+                crop_paths, should_stop=should_stop,
+            )
         cls_time = time.time() - t1
 
+        if len(cls_results) != len(dets):
+            raise RuntimeError(
+                f"分类结果数量 ({len(cls_results)}) 与检测框数 ({len(dets)}) 不一致"
+            )
+
+        thr_mismatch = 0
         for d, r in zip(dets, cls_results):
-            d.defect_class = r.get("class", "ERROR")
-            d.defect_conf = r.get("confidence", 0.0)
-            d.all_scores = r.get("all_scores", {})
+            d.apply_classifier_result(r, known_classes=known_classes)
+            if d.max_class and d.defect_class and d.max_class != d.defect_class:
+                thr_mismatch += 1
+        if thr_mismatch:
+            _log(
+                f"提示: {thr_mismatch} 个目标经 class_thresholds 决策后 "
+                f"预测类 ≠ 最高分（与单张检测页逻辑相同，属正常）"
+            )
 
-        # 按分类结果重命名裁剪图（0001.jpg → 0001_局部破损.jpg）
-        for i, d in enumerate(dets):
-            old_path = crops_dir / f"{i + 1:04d}.jpg"
-            if old_path.exists() and d.defect_class and d.defect_class != "ERROR":
-                new_name = f"{i + 1:04d}_{d.defect_class}.jpg"
-                new_path = crops_dir / new_name
-                try:
-                    old_path.rename(new_path)
-                    d.crop_path = str(new_path)
-                except OSError:
-                    pass  # 重命名失败时保留原名
-
-        if progress_cb:
-            progress_cb(3, 4)
+        # 写盘一次：文件名用模型最高分类别（与可视化一致）
+        _stage(f"保存 {path.name}", 4)
+        for i, (d, crop) in enumerate(zip(dets, crop_bgr)):
+            vis_cls = d.display_class
+            if vis_cls and vis_cls != "ERROR":
+                name = f"{i + 1:04d}_{vis_cls}.jpg"
+            else:
+                name = f"{i + 1:04d}.jpg"
+            crop_path = str(crops_dir / name)
+            cv2.imwrite(crop_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            d.crop_path = crop_path
 
         # ── 5. 可视化 + 保存结果 ──────────────────────────────────
         _log("生成可视化与统计...")
@@ -1007,9 +1126,6 @@ class SahiPipeline:
         _log(f"统计: 钻石 {stats['total_diamonds']} 个 | "
              + " | ".join(f"{k}:{v}" for k, v in stats["defect_counts"].items())
              + f" | 总耗时 {stats['total_time_s']:.2f}s")
-
-        if progress_cb:
-            progress_cb(4, 4)
 
         return stats
 
@@ -1090,10 +1206,10 @@ class SahiPipeline:
         out_dir: str,
         skip_stats: Optional[Dict[str, int]] = None,
     ) -> dict:
-        """构建统计字典。"""
+        """构建统计字典（类别计数按可视化用的最高分类别）。"""
         defect_counts: Dict[str, int] = {}
         for d in dets:
-            cls = d.defect_class or "未分类"
+            cls = d.display_class or "未分类"
             defect_counts[cls] = defect_counts.get(cls, 0) + 1
         skip = skip_stats or {}
         return {

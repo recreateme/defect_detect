@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-机台 ONNX-GPU 精简打包（不含 PyTorch）。
+机台打包：ONNX 分类 + SAHI/YOLO 大图检测（-D onedir）。
 
 正式打包唯一入口（勿用根目录手写 .spec）：
-  1. 校验 checkpoints、切换 onnxruntime(-gpu)
+  1. 校验 checkpoints、确认 ORT 可用（已安装则保留当前版本，不降级）
   2. 收集 nvidia CUDA pip DLL → build_staging/cuda_deps/
-  3. PyInstaller 打包 app_deploy.py，注入 pyinstaller_hooks/rthook_ort_dll.py
-  4. _patch_dist：补全 ORT 文件、去重 DLL、移除 TensorRT Provider
-  5. checkpoints 放到 exe 同级
+  3. 校验 torch / ultralytics / opencv（YOLO 检测）
+  4. PyInstaller --onedir 打包 app_deploy.py + rthook + SAHI 依赖
+  5. _patch_dist；checkpoints 与 detect_weights 放到 exe 同级
 
-请在 defects-deploy 环境中运行:
-  conda activate defects-deploy
+可在 defects-deploy 或 cv-yolo 环境中运行（推荐 defects-deploy 避免污染开发环境）:
+  conda activate defects-deploy   # 或: conda activate cv-yolo
   python scripts/build_deploy.py
 """
 
@@ -44,13 +44,15 @@ CUDA_PIP = (
     "nvidia-cublas-cu12",
 )
 
+# 分类用 ORT；检测用 torch+ultralytics+scipy，故不再排除这些
+# ultralytics 运行时 import matplotlib，必须打入；仅排除训练/无关包
+# 注意：sympy 不能排除 — ultralytics/torch 运行时链路需要它（YOLO 加载会 import sympy）
 ORT_EXCLUDES = [
-    "torch", "torchvision", "torchaudio",
-    "scipy", "matplotlib", "pandas", "sklearn", "tensorboard", "ultralytics",
-    "onnx", "onnxscript", "sympy",
+    "torchaudio",
+    "pandas", "sklearn", "tensorboard",
+    "onnx", "onnxscript",
     "onnxruntime.transformers",
     "onnxruntime.quantization",
-    "nvidia",
 ]
 
 
@@ -68,11 +70,7 @@ def _patch_dist(dist: Path) -> None:
         trt.unlink()
         print("[补丁] 已移除 onnxruntime_providers_tensorrt.dll")
 
-    # PyInstaller 可能从 site-packages 再收集 nvidia/，与 cuda_deps 重复
-    nvidia_dir = internal / "nvidia"
-    if nvidia_dir.is_dir():
-        shutil.rmtree(nvidia_dir)
-        print("[补丁] 已移除重复的 _internal/nvidia/")
+    # ORT 用 cuda_deps/；torch/YOLO 可能依赖 _internal/nvidia/，不可再删
 
     # 移除 _internal 根目录上与 capi/cuda_deps 重复的 DLL（历史扁平化残留）
     capi_dlls = {f.name for f in capi.glob("*.dll")}
@@ -131,12 +129,42 @@ def _patch_dist(dist: Path) -> None:
 
 
 def _ensure_cuda_runtime() -> None:
-    print("[依赖] 确保 CUDA 运行时 (cuDNN / cudart / cublas) ...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-U", *CUDA_PIP],
-        cwd=ROOT,
-        check=True,
-    )
+    """仅检查 CUDA 运行时 DLL 是否可用（cudart/cublas）；已安装则保留当前版本，
+    不强制升级，避免污染开发环境。cudnn 由 torch/lib 提供，此处不检查。"""
+    import glob
+    import site
+
+    found_cudart = False
+    found_cublas = False
+    for sp in site.getsitepackages() + [site.getusersitepackages()]:
+        if not sp:
+            continue
+        for dll in glob.glob(str(Path(sp) / "nvidia" / "*" / "bin" / "*.dll")):
+            name = Path(dll).name.lower()
+            if name.startswith("cudart64"):
+                found_cudart = True
+            if name.startswith("cublas64") or name.startswith("cublaslt64"):
+                found_cublas = True
+    # torch/lib 也自带 cudart/cublas（CUDA13），同样算可用
+    try:
+        import torch  # noqa: WPS433
+        tlib = Path(torch.__file__).parent / "lib"
+        for dll in glob.glob(str(tlib / "*.dll")):
+            name = Path(dll).name.lower()
+            if name.startswith("cudart64"):
+                found_cudart = True
+            if name.startswith("cublas64") or name.startswith("cublaslt64"):
+                found_cublas = True
+    except Exception:
+        pass
+
+    print(f"[CUDA] cudart={'OK' if found_cudart else 'MISSING'}  cublas={'OK' if found_cublas else 'MISSING'}")
+    if not (found_cudart and found_cublas):
+        raise SystemExit(
+            "[错误] 缺少 CUDA 运行时 DLL (cudart/cublas)。\n"
+            "       pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12\n"
+            "       或确认 torch 已安装（torch/lib 自带）"
+        )
 
 
 def _stage_cuda_dlls(dest: Path) -> int:
@@ -152,6 +180,10 @@ def _stage_cuda_dlls(dest: Path) -> int:
         if not sp:
             continue
         for src in glob.glob(str(Path(sp) / "nvidia" / "*" / "bin" / "*.dll")):
+            # 跳过 cudnn：torch cu132 自带 cudnn 9.x，混用会导致
+            # CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH
+            if Path(src).parent.parent.name == "cudnn":
+                continue
             name = Path(src).name
             if name in seen:
                 continue
@@ -177,25 +209,42 @@ def _test_cuda_provider() -> None:
     onnx = ROOT / "checkpoints" / "model.onnx"
     if not onnx.exists():
         return
-    sess = ort.InferenceSession(
-        str(onnx),
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-    )
-    active = sess.get_providers()
-    if active and active[0] == "CUDAExecutionProvider":
-        print("[ORT] CUDA Provider 实测 OK")
-    else:
-        print(f"[警告] CUDA Provider 未激活，当前: {active}")
+    try:
+        sess = ort.InferenceSession(
+            str(onnx),
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        active = sess.get_providers()
+        if active and active[0] == "CUDAExecutionProvider":
+            print("[ORT] CUDA Provider 实测 OK")
+        else:
+            print(f"[警告] CUDA Provider 未激活，当前: {active}")
+    except Exception as exc:
+        print(f"[警告] CUDA Provider 试跑失败，运行时将回退 CPU：{type(exc).__name__}: {exc}")
 
 
 def _ensure_ort(use_gpu: bool) -> None:
+    """确保 ORT 可用：已安装则保留当前版本（不降级，避免污染开发环境）；
+    未安装才按 ORT_GPU_VER 安装。同时清理对立包（仅当对方存在且本方已就绪时）。"""
+    from app_paths import setup_ort_dll_paths
+    setup_ort_dll_paths()
+    try:
+        import onnxruntime as ort  # noqa: WPS433
+        cur = ort.__version__
+        print(f"[ORT] 已安装 onnxruntime {cur}  Provider: {ort.get_available_providers()}")
+        if use_gpu and "CUDAExecutionProvider" not in ort.get_available_providers():
+            print(f"[警告] 当前 ORT 无 CUDA Provider，可能装的是 CPU 版 onnxruntime。")
+        return
+    except ImportError:
+        pass
+
     if use_gpu:
         pkg_spec = f"onnxruntime-gpu=={ORT_GPU_VER}"
         other = "onnxruntime"
     else:
         pkg_spec = "onnxruntime"
         other = "onnxruntime-gpu"
-    print(f"[依赖] 确保已安装 {pkg_spec} ...")
+    print(f"[依赖] 未检测到 ORT，安装 {pkg_spec} ...")
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "-U", pkg_spec],
         cwd=ROOT,
@@ -205,7 +254,6 @@ def _ensure_ort(use_gpu: bool) -> None:
         [sys.executable, "-m", "pip", "uninstall", "-y", other],
         cwd=ROOT,
     )
-    from app_paths import setup_ort_dll_paths
     setup_ort_dll_paths()
     import onnxruntime as ort  # noqa: WPS433
     print(f"[ORT] 版本 {ort.__version__}  Provider: {ort.get_available_providers()}")
@@ -214,22 +262,110 @@ def _ensure_ort(use_gpu: bool) -> None:
 def _warn_if_wrong_env() -> None:
     try:
         import torch  # noqa: WPS433
-        print(
-            "[警告] 当前环境检测到 PyTorch，建议使用独立打包环境:\n"
-            "       conda activate defects-deploy\n"
-            "       或运行 scripts/setup_deploy_env.ps1"
-        )
+        print(f"[SAHI] torch {torch.__version__}  cuda={torch.cuda.is_available()}")
     except ImportError:
-        pass
+        print(
+            "[错误] 机台钻石检测需要 PyTorch + ultralytics + opencv-python。\n"
+            "       conda activate cv-yolo  (或 defects-deploy)\n"
+            "       pip install ultralytics opencv-python\n"
+            "       pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124"
+        )
+        raise SystemExit(1)
+
+
+def _ensure_sahi_deps() -> None:
+    missing: list[str] = []
+    try:
+        import torchvision  # noqa: WPS433
+        print(f"[SAHI] torchvision {getattr(torchvision, '__version__', '?')}")
+    except ImportError:
+        missing.append("torchvision")
+    try:
+        import ultralytics  # noqa: WPS433
+        print(f"[SAHI] ultralytics {getattr(ultralytics, '__version__', '?')}")
+    except ImportError:
+        missing.append("ultralytics")
+    try:
+        import cv2  # noqa: WPS433
+        print(f"[SAHI] opencv {cv2.__version__}")
+    except ImportError:
+        missing.append("opencv-python")
+    if missing:
+        print("[错误] 缺少: " + ", ".join(missing))
+        print("       pip install ultralytics opencv-python torchvision")
+        raise SystemExit(1)
+
+
+def _resolve_yolo_src() -> Path | None:
+    """打包时复制 YOLO 权重：app_config / detect_weights / checkpoints。"""
+    cfg = ROOT / "app_config.json"
+    if cfg.is_file():
+        try:
+            import json
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            raw = str(data.get("yolo_path", "")).strip()
+            if raw:
+                p = Path(raw)
+                if p.is_file():
+                    return p
+                rel = ROOT / raw
+                if rel.is_file():
+                    return rel
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    for cand in (
+        ROOT / "detect_weights" / "best.pt",
+        ROOT / "checkpoints" / "yolo.pt",
+        ROOT / "checkpoints" / "best.pt",
+    ):
+        if cand.is_file() and cand.name != "best_model.pt":
+            return cand
+    return None
+
+
+# 机台版默认配置（须与 app.py 的 _DEFAULT_CFG_DEPLOY 保持一致：相对路径，无开发机绝对路径）
+_DEPLOY_APP_CONFIG = {
+    "pt_path":          "",                       # 机台分类不使用 .pt
+    "onnx_path":        "checkpoints/model.onnx",
+    "data_dir":         "data",
+    "corrections_dir":  "corrections",
+    "use_gpu":          True,
+    "yolo_path":        "detect_weights/best.pt",
+    "sahi_device":      "auto",
+    "sahi_slice_size":  1280,
+    "sahi_overlap":     0.20,
+    "sahi_det_conf":    0.35,
+    "sahi_batch_size":  8,
+    "sahi_crop_padding": 15,
+    "sahi_output_dir":  "sahi_output",
+    "sahi_ios_thresh":     0.60,
+    "sahi_min_area_ratio": 0.45,
+    "sahi_max_aspect_ratio": 1.5,
+    "sahi_edge_filter":    True,
+    "sahi_edge_margin_px": 20,
+}
+
+
+def _write_deploy_app_config(dist: Path) -> None:
+    """写入机台版 app_config.json 到 exe 同级，使用相对路径。
+    避免复制开发机 app_config.json（含绝对路径）污染机台。"""
+    import json
+    target = dist / "app_config.json"
+    target.write_text(
+        json.dumps(_DEPLOY_APP_CONFIG, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[配置] 已写入机台版 app_config.json -> {target}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="机台 ONNX-GPU 精简打包")
+    parser = argparse.ArgumentParser(description="机台打包：ONNX 分类 + SAHI/YOLO 检测")
     parser.add_argument("--console", action="store_true", help="保留控制台窗口")
     parser.add_argument("--cpu-only", action="store_true", help="使用 CPU 版 onnxruntime")
     args = parser.parse_args()
 
     _warn_if_wrong_env()
+    _ensure_sahi_deps()
 
     src_ckpt = ROOT / "checkpoints"
     if not (src_ckpt / "model.onnx").exists():
@@ -254,12 +390,18 @@ def main() -> int:
         _stage_cuda_dlls(CUDA_STAGING)
 
     sep = ";" if sys.platform == "win32" else ":"
+    icon = ROOT / "assets" / "app.ico"
     cmd = [
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+        "--onedir",  # -D：目录模式，机台须整包复制
         "--name", "缺陷分类系统",
         "--windowed" if not args.console else "--console",
         "--distpath", "dist", "--workpath", "build",
         f"--runtime-hook={RTHOOK}",
+    ]
+    if icon.is_file():
+        cmd.extend(["--icon", str(icon)])
+    cmd.extend([
         "--hidden-import", "PyQt5.sip",
         "--hidden-import", "onnxruntime",
         "--hidden-import", "onnxruntime.capi",
@@ -269,10 +411,25 @@ def main() -> int:
         "--hidden-import", "onnxruntime.capi.build_and_package_info",
         "--hidden-import", "PIL",
         "--hidden-import", "numpy",
+        "--hidden-import", "sahi_detector",
+        "--hidden-import", "inference_engine_onnx",
+        "--hidden-import", "inference_common",
+        "--hidden-import", "ultralytics",
+        "--hidden-import", "torch",
+        "--hidden-import", "torchvision",
+        "--hidden-import", "cv2",
+        "--hidden-import", "yaml",
+        "--hidden-import", "sympy",
         "--collect-submodules", "onnxruntime.capi",
         "--collect-binaries", "onnxruntime",
+        "--collect-all", "ultralytics",
+        "--collect-all", "torch",
+        "--collect-all", "torchvision",
+        "--collect-all", "cv2",
+        "--collect-all", "matplotlib",
+        "--collect-all", "sympy",
         "app_deploy.py",
-    ]
+    ])
     if not args.cpu_only and CUDA_STAGING.is_dir():
         cmd.insert(-1, f"--add-data={CUDA_STAGING}{sep}cuda_deps")
     for mod in ORT_EXCLUDES:
@@ -287,6 +444,18 @@ def main() -> int:
     dst.mkdir(parents=True, exist_ok=True)
     for f in STAGING.iterdir():
         shutil.copy2(f, dst / f.name)
+
+    yolo_src = _resolve_yolo_src()
+    yolo_dst_dir = DIST / "detect_weights"
+    yolo_dst_dir.mkdir(parents=True, exist_ok=True)
+    if yolo_src is not None and yolo_src.is_file():
+        shutil.copy2(yolo_src, yolo_dst_dir / "best.pt")
+        print(f"[YOLO] 已复制检测权重: {yolo_src} -> detect_weights/best.pt")
+    else:
+        print("[警告] 未找到 YOLO .pt，机台需在「设置 → 切片推理配置」中指定 detect_weights/best.pt")
+
+    # 写入机台版 app_config.json（相对路径，避免开发机绝对路径污染）
+    _write_deploy_app_config(DIST)
 
     internal = DIST / "_internal"
     buckets: dict[str, float] = {}

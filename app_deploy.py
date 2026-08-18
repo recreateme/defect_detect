@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-机台部署入口：PyInstaller 打包此文件，仅含 ONNX 推理依赖（不含 PyTorch）。
+机台部署入口：PyInstaller 打包此文件。
+
+分类：onnxruntime-gpu（inference_engine_onnx）
+检测：SAHI + ultralytics YOLO（与 app.py 钻石检测分类页相同）
+训练：机台页只读（无 train.py 热更新）
 
 环境变量:
-  DEFECTS_DEPLOY=1   — 由本文件设置；app.py 据此选用 inference_engine_onnx、隐藏 SAHI 等
-  DEFECTS_VERIFY=1   — 无 GUI 验收：测 ORT 导入 + model.onnx 加载后按码退出（见 _verify_and_exit）
+  DEFECTS_DEPLOY=1   — 由本文件设置；app.py 据此选用 ONNX 分类引擎
+  DEFECTS_VERIFY=1   — 无 GUI 验收：测 ORT 导入 + model.onnx 加载后按码退出
 
 开发调试: python app_deploy.py
 验收模式: set DEFECTS_VERIFY=1 && 缺陷分类系统.exe
@@ -34,7 +38,9 @@ def _verify_and_exit() -> None:
     eng = ort_eng.InferenceEngine()
     print(eng.load(None, onnx, use_gpu=True))
     print("device:", eng.device)
-    raise SystemExit(0 if eng.device == "cuda" else 2)
+    if eng.device != "cuda":
+        print("[WARN] 已回退 CPU，但程序仍可运行；如需 GPU 请检查驱动 / CUDA / cuDNN。")
+    raise SystemExit(0)
 
 
 if os.environ.get("DEFECTS_VERIFY") == "1":

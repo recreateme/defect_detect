@@ -234,6 +234,71 @@ class InferenceEngine:
             should_stop=should_stop,
         )
 
+    @torch.inference_mode()
+    def predict_batch_images(
+        self,
+        images: List[Image.Image],
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        result_cb: Optional[Callable[[int, Dict], None]] = None,
+        batch_size: Optional[int] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> List[Dict]:
+        """
+        内存图像批量推理（SAHI 裁剪用）。
+
+        与 predict_batch(路径) 共用：self.transform、self.classes、self._thr_vec、
+        run_batch_predict → logits_row_to_result / build_result_dict，
+        保证与「缺陷检测」页同一套类别名与置信度语义。
+        """
+        if not self.loaded:
+            raise RuntimeError("模型未加载，请先在「设置」页面加载模型。")
+        keys = [f"mem:{i}" for i in range(len(images))]
+        rgb = [im.convert("RGB") if im.mode != "RGB" else im for im in images]
+
+        if self.backend == "onnx":
+            session = self.ort_session
+            input_name = self._input_name
+
+            def _preprocess_chw(key: str) -> np.ndarray:
+                idx = int(key.split(":", 1)[1])
+                return self.transform(rgb[idx]).numpy()
+
+            def _infer_batch(batch: np.ndarray) -> np.ndarray:
+                return session.run(None, {input_name: batch})[0]
+
+            return run_batch_predict(
+                keys,
+                batch_size=batch_size or self._batch_size,
+                preprocess_one=_preprocess_chw,
+                stack_batch=lambda ts: np.stack(ts, axis=0).astype(np.float32, copy=False),
+                infer_batch=_infer_batch,
+                classes=self.classes,
+                thr_vec=self._thr_vec,
+                progress_cb=progress_cb,
+                result_cb=result_cb,
+                should_stop=should_stop,
+            )
+
+        model = self.model
+        device = self.device
+
+        def _preprocess_chw(key: str) -> torch.Tensor:
+            idx = int(key.split(":", 1)[1])
+            return self.transform(rgb[idx])
+
+        return run_batch_predict(
+            keys,
+            batch_size=batch_size or self._batch_size,
+            preprocess_one=_preprocess_chw,
+            stack_batch=lambda ts: torch.stack(ts).to(device),
+            infer_batch=lambda batch: model(batch).detach().cpu().numpy(),
+            classes=self.classes,
+            thr_vec=self._thr_vec,
+            progress_cb=progress_cb,
+            result_cb=result_cb,
+            should_stop=should_stop,
+        )
+
     def _preprocess(self, image_path: str) -> torch.Tensor:
         with Image.open(image_path) as im:
             return self.transform(im.convert("RGB")).unsqueeze(0)

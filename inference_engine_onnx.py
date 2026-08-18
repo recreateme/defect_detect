@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-机台部署专用推理引擎（ONNX Runtime + NumPy + Pillow，不依赖 PyTorch）。
+机台部署专用分类引擎（ONNX Runtime + NumPy + Pillow）。
 
 由 app_deploy / DEFECTS_DEPLOY=1 选用；开发版见 inference_engine.py（PyTorch 优先）。
+大图 SAHI 检测另走 ultralytics/torch，分类仍走本引擎（含 predict_batch_images）。
 DLL 搜索统一走 app_paths.setup_ort_dll_paths()（冻结环境另有 rthook 最早兜底）。
 
 性能要点：
@@ -154,11 +155,22 @@ class InferenceEngine:
 
         providers, picked = pick_ort_providers(use_gpu)
         sess_opts = _make_session_options()
-        self.ort_session = ort.InferenceSession(
-            str(onnx_path),
-            sess_options=sess_opts,
-            providers=providers,
-        )
+        session_error = ""
+        try:
+            self.ort_session = ort.InferenceSession(
+                str(onnx_path),
+                sess_options=sess_opts,
+                providers=providers,
+            )
+        except Exception as exc:
+            if not use_gpu:
+                raise
+            session_error = f"{type(exc).__name__}: {exc}"
+            self.ort_session = ort.InferenceSession(
+                str(onnx_path),
+                sess_options=sess_opts,
+                providers=["CPUExecutionProvider"],
+            )
         inputs = self.ort_session.get_inputs()
         self._input_name = inputs[0].name if inputs else "input"
 
@@ -175,12 +187,19 @@ class InferenceEngine:
 
         dev_label = "GPU" if self.device == "cuda" else "CPU"
         if use_gpu and self.device != "cuda":
-            hint = (
-                f"模型加载成功  [ONNX / {dev_label}]  {len(self.classes)} 类别 "
-                f"· {self.img_size}px · batch={self._batch_size}\n"
-                f"（已请求 GPU，但 CUDA 不可用，可用: "
-                f"{', '.join(ort_available_providers())}）"
-            )
+            if session_error:
+                hint = (
+                    f"模型加载成功  [ONNX / {dev_label}]  {len(self.classes)} 类别 "
+                    f"· {self.img_size}px · batch={self._batch_size}\n"
+                    f"（已请求 GPU，但 CUDA 初始化失败，已回退 CPU：{session_error}）"
+                )
+            else:
+                hint = (
+                    f"模型加载成功  [ONNX / {dev_label}]  {len(self.classes)} 类别 "
+                    f"· {self.img_size}px · batch={self._batch_size}\n"
+                    f"（已请求 GPU，但 CUDA 不可用，可用: "
+                    f"{', '.join(ort_available_providers())}）"
+                )
         else:
             hint = (
                 f"模型加载成功  [ONNX / {dev_label}]  {len(self.classes)} 类别 "
@@ -230,6 +249,46 @@ class InferenceEngine:
             image_paths,
             batch_size=batch_size or self._batch_size,
             preprocess_one=self._preprocess_chw,
+            stack_batch=lambda ts: np.stack(ts, axis=0).astype(np.float32, copy=False),
+            infer_batch=_infer_batch,
+            classes=self.classes,
+            thr_vec=self._thr_vec,
+            progress_cb=progress_cb,
+            result_cb=result_cb,
+            should_stop=should_stop,
+        )
+
+    def predict_batch_images(
+        self,
+        images: List[Image.Image],
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        result_cb: Optional[Callable[[int, Dict], None]] = None,
+        batch_size: Optional[int] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> List[Dict]:
+        """
+        内存图像批量推理（SAHI 裁剪用）。
+        与 predict_batch / 开发版引擎同一套 classes、阈值与 preprocess。
+        """
+        if not self.loaded:
+            raise RuntimeError("模型未加载，请先在「设置」页面加载模型。")
+        rgb = [im.convert("RGB") if im.mode != "RGB" else im for im in images]
+        keys = [f"mem:{i}" for i in range(len(rgb))]
+
+        def _preprocess_chw(key: str) -> np.ndarray:
+            idx = int(key.split(":", 1)[1])
+            return self._preprocess_image(rgb[idx])
+
+        session = self.ort_session
+        input_name = self._input_name
+
+        def _infer_batch(batch: np.ndarray) -> np.ndarray:
+            return session.run(None, {input_name: batch})[0]
+
+        return run_batch_predict(
+            keys,
+            batch_size=batch_size or self._batch_size,
+            preprocess_one=_preprocess_chw,
             stack_batch=lambda ts: np.stack(ts, axis=0).astype(np.float32, copy=False),
             infer_batch=_infer_batch,
             classes=self.classes,

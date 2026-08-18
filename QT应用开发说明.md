@@ -13,7 +13,7 @@ main()
             ├─ sidebar     # QWidget + QVBoxLayout，固定宽度导航
             │    └─ QPushButton × 5~6（objectName="nav"）
             └─ QStackedWidget（stack）
-                 ├─ DiamondDetectPage  钻石检测分类（SAHI，仅开发版显示入口）
+                 ├─ DiamondDetectPage  钻石检测分类（SAHI，开发/机台均显示）
                  ├─ DetectionPage    缺陷检测
                  ├─ ResultsPage      结果管理
                  ├─ CorrectionPage   误分类修正
@@ -30,9 +30,9 @@ main()
 | 跨页通信 | 子页面定义 `pyqtSignal`，在 `MainWindow._build_ui` 里 `connect` |
 | 长任务 | `QThread` 子类 + 信号回传，不在主线程做推理/训练/SAHI |
 
-对应源码：`MainWindow._build_ui()`（约 **3560** 行起）。
+对应源码：`MainWindow._build_ui()`（类 `MainWindow` 在 `app.py` 后部，用 IDE「转到定义」定位，勿依赖行号）。
 
-**双入口说明**：`app.py` 与 `app_deploy.py` 共用同一套 UI。机台入口在 import 前设置 `DEFECTS_DEPLOY=1`，从而选用 `inference_engine_onnx`、隐藏「钻石检测分类」导航与 SAHI 相关配置，并在窗口标题追加「· 机台版」。
+**双入口说明**：`app.py` 与 `app_deploy.py` 共用同一套 UI。机台入口在 import 前设置 `DEFECTS_DEPLOY=1`（冻结 exe 亦视为机台），选用 `inference_engine_onnx` 做缺陷分类，窗口标题追加「· 机台版」。启动时自动加载分类模型（`MainWindow._auto_load_model`）。「钻石检测分类」与切片推理配置在机台同样可用（YOLO+SAHI）。设置页默认管理员锁定。
 
 ---
 
@@ -390,7 +390,7 @@ QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
 ## 11. 只读与权限：AdminLockBar
 
-「模型再训练」「设置」默认只读：
+「模型再训练」「设置」默认只读（机台日常检测依赖启动自动加载，不必进设置）：
 
 1. `RetrainPage` / `SettingsPage` 顶部 `AdminLockBar`，点击「输入密码解锁」→ `unlock_requested`。
 2. 页面转发为 `admin_unlock_requested`，由 `MainWindow._try_unlock_admin_pages` 接收。
@@ -422,6 +422,8 @@ QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 | 样式不生效 | 未 `setProperty` / `objectName`，或未 `polish` |
 | 中文乱码 | 检查 `QFont`、文件 UTF-8、CSV 编码 |
 | 打包后无界面 | 确认 `main()` 已调用 `multiprocessing.freeze_support()`（本项目已实现） |
+| 打包后弹出黑框 | 须用 `build_deploy.py` 默认 `--windowed`，不要加 `--console` |
+| 分类引擎未加载 | 机台应有 exe 同级 `app_config.json` + `checkpoints/model.onnx`；启动会自动 load |
 
 ### 12.4 学习资源
 
@@ -437,7 +439,7 @@ QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 | 符号 / 区域 | 内容 |
 |-------------|------|
 | 模块头、`DEPLOY_ONNX_ONLY`、`NAV_*` | 机台开关、导航、SAHI 依赖检查 |
-| `_DEFAULT_CFG_FULL` / `_load_cfg` / `_save_cfg` | 默认配置与 `app_config.json` |
+| `_DEFAULT_CFG_FULL` / `_DEFAULT_CFG_DEPLOY` / `_load_cfg` | 默认配置与 `app_config.json`（机台 `yolo_path=detect_weights/best.pt`，长宽比默认 1.5） |
 | `STYLE` | 全局 QSS |
 | `AppState`、`AdminLockBar` | 共享状态、管理员解锁条 |
 | `InferenceWorker`、`TrainWorker`、`SahiPipelineWorker` | 后台线程 |
@@ -447,8 +449,8 @@ QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 | `CorrectionPage` | 误分类修正 |
 | `RetrainPage` | 模型再训练（机台只读） |
 | `SettingsPage` | 分类配置 + 切片推理配置 Tab（阈值见 `class_thresholds.json`） |
-| `DiamondDetectPage` | 钻石检测分类（仅开发版） |
-| `MainWindow`、`main()` | 窗口组装与入口（含 `freeze_support`） |
+| `DiamondDetectPage` | 钻石检测分类（开发/机台） |
+| `MainWindow`、`_auto_load_model`、`main()` | 窗口组装、启动自动加载分类模型、入口 |
 
 在 IDE 中用「转到定义」定位上述类/函数即可，勿依赖易漂移的行号。
 
@@ -464,9 +466,9 @@ Qt 层只负责：**展示、交互、线程调度、配置持久化**。
 | `inference_engine.py` | 开发版推理（PyTorch GPU 优先，ONNX 回退；`predict` / `predict_batch`） |
 | `inference_engine_onnx.py` | 机台版推理（ONNX Runtime；打包 exe 使用） |
 | `inference_common.py` | 元数据；**`run_batch_predict`** 批量循环；**`logits_row_to_result`**；**`build_result_dict`** 阈值决策 |
-| `sahi_detector.py` | SAHI 切片检测 + 裁剪 + 调用 `predict_batch` 分类（仅开发版 `app.py`） |
+| `sahi_detector.py` | SAHI 切片检测 + 裁剪 + `predict_batch_images` 分类（开发/机台共用） |
 | `train.py` | 训练、微调、ONNX 导出、阈值校准 |
-| `app_deploy.py` | 机台版 GUI 入口（无 PyTorch / SAHI） |
+| `app_deploy.py` | 机台版 GUI 入口（ONNX 分类 + SAHI/YOLO 检测） |
 
 ### 14.1 检测结果 dict（UI 与引擎之间）
 

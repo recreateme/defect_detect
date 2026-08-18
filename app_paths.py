@@ -59,7 +59,11 @@ def chdir_app_root() -> None:
 
 
 def _nvidia_site_bin_dirs() -> list[Path]:
-    """开发环境：nvidia-* pip 包内的 bin 目录（cuDNN / CUDA runtime 等）。"""
+    """开发环境：nvidia-* pip 包内的 bin 目录（CUDA runtime / cublas）。
+
+    注意：排除 cudnn 目录 — torch cu132 自带 cudnn 9.x，若同时有 nvidia-cudnn-cu12
+    的同名 DLL 在搜索路径中，会导致 CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH。
+    """
     try:
         import site
         import glob
@@ -73,17 +77,46 @@ def _nvidia_site_bin_dirs() -> list[Path]:
             for dll in glob.glob(os.path.join(sp, "nvidia", "*", "bin", "*.dll")):
                 folder = Path(dll).parent
                 key = str(folder.resolve())
-                if key not in seen:
-                    seen.add(key)
-                    dirs.append(folder)
+                if key in seen:
+                    continue
+                # 跳过 cudnn：torch/lib 自带，避免同名版本冲突
+                if folder.parent.name == "cudnn":
+                    continue
+                seen.add(key)
+                dirs.append(folder)
         return dirs
     except Exception:
         return []
 
 
+def _torch_lib_dir() -> Path | None:
+    """torch/lib 目录（cu132 自带 cudnn/cudart/cublas，须优先于 nvidia cu12 避免同名冲突）。"""
+    try:
+        if is_frozen():
+            cand = bundle_dir() / "torch" / "lib"
+            if cand.is_dir():
+                return cand
+        else:
+            import site
+            for sp in site.getsitepackages() + [site.getusersitepackages()]:
+                if not sp:
+                    continue
+                cand = Path(sp) / "torch" / "lib"
+                if cand.is_dir():
+                    return cand
+    except Exception:
+        pass
+    return None
+
+
 def ort_native_dirs() -> list[Path]:
-    """ORT 及 CUDA 原生 DLL 搜索目录（顺序敏感：capi 优先于 cuda_deps）。"""
+    """ORT 及 CUDA 原生 DLL 搜索目录（顺序敏感：torch/lib 优先，避免 cudnn 同名冲突）。"""
     dirs: list[Path] = []
+    # torch/lib 必须在最前面：torch cu132 自带 cudnn64_9.dll (CUDA13)，
+    # 若 nvidia/cudnn/bin (CUDA12) 抢先加载同名 DLL，torch 会 WinError 127
+    torch_lib = _torch_lib_dir()
+    if torch_lib is not None:
+        dirs.append(torch_lib)
     if is_frozen():
         base = bundle_dir()
         capi = base / "onnxruntime" / "capi"

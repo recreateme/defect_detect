@@ -1,4 +1,4 @@
-# 机台 ONNX-GPU 精简部署（不含 PyTorch）— 仅用于 defects-deploy 打包环境
+# 机台部署（defects-deploy）— 分类 ONNX + 大图 SAHI/YOLO 检测
 PyQt5>=5.15
 Pillow>=10.0
 numpy>=1.24,<2.5
@@ -7,3 +7,8 @@ nvidia-cudnn-cu12
 nvidia-cuda-runtime-cu12
 nvidia-cublas-cu12
 pyinstaller>=6.0
+
+# 钻石检测分类（YOLO）；torch 请按 CUDA 安装，例如:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+ultralytics>=8.0.0
+opencv-python>=4.8.0

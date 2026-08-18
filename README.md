@@ -21,7 +21,7 @@
 | **本文 (README.md)** | 环境、训练、应用功能、工作流 |
 | [打包部署说明.md](打包部署说明.md) | 机台 exe 打包、GPU 部署、故障排查 |
 | [QT应用开发说明.md](QT应用开发说明.md) | PyQt5 界面结构、信号槽、线程（改 UI 时阅读） |
-| [改进计划.md](改进计划.md) | SAHI 后处理已落地项与后续建议 |
+| [废弃文档/](废弃文档/00_归档说明.md) | 已过时过程文档（改进计划、一次性结构扫描） |
 
 ---
 
@@ -30,20 +30,21 @@
 ```
 defects_classify/
 ├── app.py                    # 开发版 GUI 入口（PyTorch + ONNX + SAHI）
-├── app_deploy.py             # 机台版入口（仅 ONNX，PyInstaller 打包用）
+├── app_deploy.py             # 机台版入口（ONNX 分类 + SAHI/YOLO，PyInstaller 打包用）
 ├── train.py                  # 训练 / 微调 / ONNX 导出
 ├── inference_engine.py       # 开发版推理（PyTorch GPU 优先，支持批量）
-├── inference_engine_onnx.py  # 机台版推理（ONNX Runtime GPU/CPU）
+├── inference_engine_onnx.py  # 机台版分类推理（ONNX Runtime GPU/CPU）
 ├── inference_common.py       # 推理公共逻辑（批量循环、阈值、softmax，开发/机台共用）
-├── sahi_detector.py          # SAHI 大图切片检测 + 缺陷分类流水线（仅开发版）
+├── sahi_detector.py          # SAHI 大图切片检测 + 缺陷分类流水线（开发/机台共用）
 ├── app_paths.py              # 路径解析（开发 / 打包 exe 通用）
 ├── analyze_image_sizes.py    # 图像尺寸统计，推荐 img_size
 ├── requirements.txt          # 开发 / 训练依赖（含 ultralytics、opencv-python）
-├── requirements-deploy.txt   # 机台打包专用依赖（无 PyTorch / SAHI）
+├── requirements-deploy.txt   # 独立打包环境依赖清单（可选；当前正式包用 cv-yolo）
+├── assets/app.ico            # 应用图标（打包写入 exe）
 ├── scripts/                  # 打包与验收脚本（见下文「脚本索引」）
 │   ├── build_deploy.py       # 机台打包主脚本（唯一正式打包入口）
 │   ├── build_deploy.bat      # Windows 快捷方式
-│   ├── setup_deploy_env.ps1  # 创建 defects-deploy Conda 环境
+│   ├── setup_deploy_env.ps1  # 创建 defects-deploy Conda 环境（可选隔离环境）
 │   ├── verify_deploy.py      # 打包前 ORT + 模型验收（源码环境）
 │   └── verify_frozen_sim.py  # 打包后 exe 验收（DEFECTS_VERIFY=1）
 ├── pyinstaller_hooks/
@@ -54,31 +55,32 @@ defects_classify/
 ├── outputs/                  # analyze_image_sizes 等工具输出（git 忽略）
 ├── sahi_output/              # 钻石检测分类默认输出（git 忽略）
 ├── build_staging/            # 打包临时目录（checkpoints / cuda_deps，git 忽略）
-└── dist/缺陷分类系统/        # 打包输出（git 忽略）
+├── dist/缺陷分类系统/        # 打包输出（git 忽略）
+└── 废弃文档/                 # 过时过程文档归档
 ```
 
 ---
 
 ## 环境
 
-### 开发 / 训练（`cv-yolo` 或自建环境）
+### 开发 / 训练 / 正式打包（`cv-yolo`）
+
+当前开发机以 Conda 环境 **`cv-yolo`** 为准：训练、`python app.py`、以及 **机台 exe 正式打包** 均在此环境完成（torch 2.12.0+cu132，onnxruntime-gpu 以环境已装版本为准，不强制降级）。
 
 ```powershell
 conda activate cv-yolo
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# 按本机 CUDA 安装 torch，例如:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
 
 验证 GPU：`python -c "import torch; print(torch.cuda.is_available())"`
 
-> **RTX 50 系列（sm_120）**：若 PyTorch 版本不支持当前 GPU 算力，SAHI 切片推理会在 `auto` 模式下自动回退 CPU，或安装支持 sm_120 的 PyTorch（CUDA 12.8+ / nightly）。
+> **RTX 50 系列（sm_120）**：若 PyTorch 版本不支持当前 GPU 算力，SAHI 切片推理会在 `auto` 模式下自动回退 CPU，或安装支持 sm_120 的 PyTorch。
 
-### 机台打包（`defects-deploy`，与训练环境隔离）
+### 可选隔离打包环境（`defects-deploy`）
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/setup_deploy_env.ps1
-conda activate defects-deploy
-```
+若不想用开发环境打包，可另建 `defects-deploy`（见 `scripts/setup_deploy_env.ps1`）。`build_deploy.py` 已安装 ORT 时**不会降级**；未安装才按脚本内回退版本安装。机台均有 GPU，以能无障碍跑通开发环境的依赖为准。
 
 详见 [打包部署说明.md](打包部署说明.md)。
 
@@ -87,11 +89,11 @@ conda activate defects-deploy
 | 脚本 | 用途 |
 |------|------|
 | `build_deploy.py` / `build_deploy.bat` | 正式机台打包（收集 CUDA DLL、PyInstaller、补丁 dist） |
-| `setup_deploy_env.ps1` | 创建/配置 `defects-deploy` Conda 环境 |
+| `setup_deploy_env.ps1` | 可选：创建隔离打包环境 `defects-deploy`（正式打包用 `cv-yolo`） |
 | `verify_deploy.py` | 打包前：当前环境 ORT + `model.onnx` 加载 |
 | `verify_frozen_sim.py` | 打包后：对 `dist/缺陷分类系统/缺陷分类系统.exe` 设 `DEFECTS_VERIFY=1` |
 
-根目录已移除过时 `.spec`；**请勿**手写 PyInstaller 规格替代 `build_deploy.py`。
+根目录 `缺陷分类系统.spec` 由 PyInstaller **自动生成**，每次打包会覆盖；**请勿**手写该文件替代 `build_deploy.py`。
 
 ---
 
@@ -130,20 +132,21 @@ python train.py --data_dir data --img_size 128
 # 开发机（完整功能，窗口标题无「机台版」）
 python app.py
 
-# 机台模式本地调试（仅 ONNX，标题显示「· 机台版」）
+# 机台模式本地调试（ONNX 分类 + SAHI 检测，标题显示「· 机台版」）
 python app_deploy.py
 ```
 
-首次运行会在 exe/项目根生成 `app_config.json`（模型路径、GPU 开关等）。
+开发版首次在设置页保存后生成 `app_config.json`。机台包由 `build_deploy.py` **写入 exe 同级**机台版配置（相对路径：`checkpoints/model.onnx`、`detect_weights/best.pt`），启动时自动加载分类 ONNX，无需再手动选模型。
 
 ### 4. 机台打包
 
 ```powershell
-conda activate defects-deploy
-python scripts/build_deploy.py
+conda activate cv-yolo
+python scripts/build_deploy.py              # 正式包：无命令行窗口
+# python scripts/build_deploy.py --console  # 仅排障时保留控制台
 ```
 
-产物：`dist/缺陷分类系统/`，**整包**复制到机台。说明见 [打包部署说明.md](打包部署说明.md)。
+产物：`dist/缺陷分类系统/`，**整包**复制到机台（约 6 GB，含 torch + YOLO）。说明见 [打包部署说明.md](打包部署说明.md)。
 
 ---
 
@@ -213,19 +216,19 @@ app.py / app_deploy.py
 
 | 页面 | 功能 | 开发版 | 机台版 |
 |------|------|--------|--------|
-| 钻石检测分类 | 5120×5120 大图 SAHI 切片检测 + 缺陷分类、批量推理 | ✅ | ❌ |
+| 钻石检测分类 | 5120×5120 大图 SAHI 切片检测 + 缺陷分类、批量推理 | ✅ | ✅ |
 | 缺陷检测 | 单张 / 文件夹批量检测、按类别导出 | ✅ | ✅ |
 | 结果管理 | 筛选、导出 CSV；与单张检测共用同一结果结构 | ✅ | ✅ |
 | 误分类修正 | 归档到 `corrections/`（按类别分子文件夹） | ✅ | ✅ |
 | 模型再训练 | 子进程训练；机台版默认只读 | ✅ | 只读 |
-| 设置 | **分类配置** Tab：模型路径、GPU；**切片推理配置** Tab：YOLO、SAHI 参数 | ✅ | 仅分类配置 |
+| 设置 | **分类配置** Tab：模型路径、GPU；**切片推理配置** Tab：YOLO、SAHI 参数 | ✅ | ✅（无 .pt 分类路径；默认只读） |
 
-「模型再训练」「设置」默认只读，输入管理员密码后可编辑（密码定义于 `app.py` 中 `ADMIN_PAGE_PASSWORD`）。
+「模型再训练」「设置」默认只读，输入管理员密码后可编辑（`app.py` 中 `ADMIN_PAGE_PASSWORD`）。机台日常检测**不需要**进设置页：启动时 `_auto_load_model` 会加载 exe 同级 `checkpoints/model.onnx`。
 
-### 钻石检测分类（开发版）
+### 钻石检测分类
 
-1. 在「设置 → 切片推理配置」配置 YOLO 权重（`.pt`）、切片大小、重叠率、设备等
-2. 在「设置 → 分类配置」加载缺陷分类模型
+1. 机台 exe 启动即加载分类 ONNX；YOLO 默认 `detect_weights/best.pt`（打包时复制）
+2. 若要改切片参数：先在「设置」输入管理员密码解锁，再改「切片推理配置」（长宽比上限默认 **1.5**，超过则视为异常框剔除）
 3. 在「钻石检测分类」选择输入图像（多选或文件夹）与结果保存目录
 4. 点击「开始处理」→ 每张图输出：裁剪图、两张全分辨率可视化图（检测框 / 分类着色）、JSON 统计；完成后可打开保存目录
 
@@ -247,7 +250,7 @@ app.py / app_deploy.py
 A: 请使用最新代码（`inference_common.run_batch_predict` 统一单张/批量）。若预测类别因阈值与最高分不同，属正常；看 `confidence`（预测类）而非得分条第一名。
 
 **Q: 开发机批量检测报 `requires grad`？**  
-A: 确保 `inference_engine.py` 的 `predict_batch` 带 `@torch.inference_mode()`（机台 exe 不受影响，不含 PyTorch）。
+A: 确保 `inference_engine.py` 的 `predict_batch` 带 `@torch.inference_mode()`（机台分类走 ONNX，不受影响）。
 
 **Q: 机台检测报输入尺寸 224 vs 128？**  
 A: 确保 `checkpoints/train_config.json` 含正确 `img_size`，并重新加载模型或使用最新 exe。
@@ -259,13 +262,22 @@ A: 覆盖机台 `checkpoints/` 下 `model.onnx`、`model.onnx.data`、`class_thr
 A: `train.py` 会自动解析项目根目录，也可显式指定 `--data_dir`；确保 `data/` 下按类别分子文件夹。
 
 **Q: 如何打包机台 exe？**  
-A: 使用 `python scripts/build_deploy.py`（或 `scripts\build_deploy.bat`）。脚本会动态收集 CUDA DLL、复制 checkpoints 并执行打包后补丁。不要依赖已删除的根目录 `.spec`。
+A: 在 `cv-yolo` 中执行 `python scripts/build_deploy.py`（默认无控制台窗口）。脚本收集 CUDA DLL、复制 checkpoints / YOLO 权重、生成机台版 `app_config.json` 并打补丁。不要用手写 `.spec` 替代。
+
+**Q: 机台 exe 提示「分类引擎未加载」？**  
+A: 确认运行的是最新整包：exe 同级须有 `app_config.json` 与 `checkpoints/model.onnx`。启动会自动加载；设置页改路径需先输入管理员密码。
 
 **Q: 机台 exe 能用钻石检测分类吗？**  
-A: 不能。SAHI / YOLO 依赖 ultralytics 与 PyTorch，仅 `python app.py` 开发版提供；机台 exe 仅含 ONNX 缺陷分类。
+A: 能。与 `app.py` 同一页：YOLO+SAHI 检测，分类仍走 ONNX。打包须用当前 `build_deploy.py`（打入 torch / ultralytics / matplotlib / sympy，并复制 `detect_weights/best.pt`）。
+
+**Q: YOLO 加载报 `No module named 'sympy'` / `matplotlib`？**  
+A: 旧包曾排除这两个模块。当前 `build_deploy.py` 已 `--collect-all sympy` 与 `matplotlib`，需用新脚本重打。
 
 **Q: SAHI 报 CUDA error 或 GPU 不兼容？**  
 A: 在「设置 → 切片推理配置」将设备设为 `auto` 或 `cpu`；新型号 GPU 需升级 PyTorch 后再用 `cuda:0`。
+
+**Q: 机台上 ONNX Runtime 报 `CUDNN_STATUS_NOT_INITIALIZED`？**  
+A: 当前机台版已做“GPU 优先、CPU 保底”：若 CUDA / cuDNN 初始化失败，分类会自动回退到 CPU 继续运行。若想恢复 GPU，请检查显卡驱动、CUDA DLL、cuDNN 以及包内 `checkpoints/model.onnx` 是否完整。
 
 ---
 
@@ -278,7 +290,7 @@ python train.py --finetune --extra_data_dirs corrections
 python train.py --postprocess_only
 python app.py
 python app_deploy.py
-conda activate defects-deploy
+conda activate cv-yolo
 python scripts/build_deploy.py
 python scripts/verify_deploy.py
 python scripts/verify_frozen_sim.py

@@ -5,7 +5,7 @@
 ================================================================================
 
 功能
-  · 钻石检测分类（开发版）：5120×5120 大图 SAHI 切片检测 + 缺陷分类
+  · 钻石检测分类：5120×5120 大图 SAHI 切片检测 + 缺陷分类（开发版与机台 exe 均提供）
   · 单图 / 文件夹批量缺陷检测
   · 检测结果管理与 CSV / 按类别文件夹导出
   · 误分类修正 → 归档至 corrections/（主动学习数据回收）
@@ -14,7 +14,8 @@
 
 依赖
   开发版: PyQt5, torch, torchvision, onnxruntime, Pillow, ultralytics, opencv-python
-  机台版: PyQt5, onnxruntime-gpu, Pillow（无 PyTorch / SAHI，由 app_deploy.py 入口）
+  机台版: PyQt5, onnxruntime-gpu, Pillow, ultralytics, opencv-python, torch（YOLO 检测）
+          分类仍走 ONNX；由 app_deploy.py 入口
 
 架构（自顶向下）
   main()
@@ -22,7 +23,7 @@
          └─ MainWindow（QMainWindow）
               ├─ sidebar — nav 按钮，objectName="nav"
               └─ QStackedWidget — 页面索引见 NAV_* 常量
-                   0 DiamondDetectPage  钻石检测分类（SAHI，仅开发版入口）
+                   0 DiamondDetectPage  钻石检测分类（SAHI）
                    1 DetectionPage      缺陷检测（单张 Tab + 批量 Tab）
                    2 ResultsPage        结果管理
                    3 CorrectionPage     误分类修正
@@ -38,8 +39,8 @@
   TrainWorker        — subprocess 运行 train.py，逐行读 stdout
 
 双入口
-  python app.py         → DEPLOY_ONNX_ONLY=False，加载 inference_engine（PyTorch 优先）
-  python app_deploy.py  → 设置 DEFECTS_DEPLOY=1，仅 inference_engine_onnx
+  python app.py         → DEPLOY_ONNX_ONLY=False，分类用 inference_engine（PyTorch 优先）
+  python app_deploy.py  → DEFECTS_DEPLOY=1，分类用 inference_engine_onnx；SAHI 检测仍可用
 
 详见项目根目录「QT应用开发说明.md」。
 """
@@ -64,8 +65,9 @@ from PyQt5.QtGui import *
 from app_paths import app_dir, chdir_app_root, is_frozen, resolve_path, setup_ort_dll_paths
 
 # ── 运行模式 ────────────────────────────────────────────────────────────────
-# True  = 机台/打包环境：仅 ONNX 引擎，不依赖 PyTorch，窗口标题带「· 机台版」
-# False = 开发环境：PyTorch GPU 优先，ONNX 作 CPU/GPU 不可用时的回退
+# True  = 机台/打包：缺陷分类仅 ONNX（inference_engine_onnx），窗口标题带「· 机台版」
+#         SAHI/YOLO 大图检测仍启用（需 ultralytics + torch + opencv）
+# False = 开发环境：分类 PyTorch GPU 优先，ONNX 作回退
 DEPLOY_ONNX_ONLY = is_frozen() or os.environ.get("DEFECTS_DEPLOY") == "1"
 
 # 机台版须在 import onnxruntime 之前配置 DLL 搜索路径（Windows 打包必需）
@@ -90,17 +92,16 @@ NAV_CORRECT   = 3   # 误分类修正
 NAV_RETRAIN   = 4   # 模型再训练
 NAV_SETTINGS  = 5   # 设置（分类配置 + 切片推理配置 Tab）
 
-# ── 大图检测依赖检查（ultralytics / opencv 为可选依赖）─────────────────────
+# ── 大图检测依赖检查（开发版 / 机台 exe 均可；缺包时页面提示安装）────────
 _HAS_SAHI_DEPS = False
 _SAHI_DEPS_MSG = ""
 try:
-    if not DEPLOY_ONNX_ONLY:
-        from sahi_detector import SahiDetector, SahiPipeline, check_ultralytics, check_cv2
-        _ok_ultra, _msg_ultra = check_ultralytics()
-        _ok_cv2,   _msg_cv2   = check_cv2()
-        _HAS_SAHI_DEPS = _ok_ultra and _ok_cv2
-        if not _HAS_SAHI_DEPS:
-            _SAHI_DEPS_MSG = (_msg_ultra if not _ok_ultra else "") + "\n" + (_msg_cv2 if not _ok_cv2 else "")
+    from sahi_detector import SahiDetector, SahiPipeline, check_ultralytics, check_cv2
+    _ok_ultra, _msg_ultra = check_ultralytics()
+    _ok_cv2,   _msg_cv2   = check_cv2()
+    _HAS_SAHI_DEPS = _ok_ultra and _ok_cv2
+    if not _HAS_SAHI_DEPS:
+        _SAHI_DEPS_MSG = (_msg_ultra if not _ok_ultra else "") + "\n" + (_msg_cv2 if not _ok_cv2 else "")
 except ImportError:
     _SAHI_DEPS_MSG = "sahi_detector 模块加载失败"
 
@@ -110,9 +111,22 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 APP_NAME = "钻石缺陷图像分类系统"
 APP_VER  = "v1.0" + (" · 机台版" if DEPLOY_ONNX_ONLY else "")
+# 窗口/任务栏图标：优先项目内 assets/app.ico，其次用户提供的素材路径
+_APP_ICON_CANDIDATES = (
+    app_dir() / "assets" / "app.ico",
+    Path(r"C:\Users\12998\Pictures\素材\cat.ico"),
+)
 CFG_FILE = app_dir() / "app_config.json"   # 可写；开发=项目根，打包后=exe 同级
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 TRAIN_SCRIPT = app_dir() / "train.py"      # RetrainPage 子进程入口
+
+
+def _load_app_icon() -> Optional[QIcon]:
+    """加载窗口图标；文件不存在时返回 None，不影响启动。"""
+    for p in _APP_ICON_CANDIDATES:
+        if p.is_file():
+            return QIcon(str(p))
+    return None
 
 # 开发版默认同时配置 .pt 与 .onnx；机台版由 FULL 派生后清空 pt_path。
 # 分类阈值见 checkpoints/class_thresholds.json，不在此配置全局置信度旋钮。
@@ -126,22 +140,23 @@ _DEFAULT_CFG_FULL: Dict = {
     "yolo_path":          "",              # YOLO .pt 路径（在设置页配置）
     "sahi_device":        "auto",
     "sahi_slice_size":    1280,
-    "sahi_overlap":       0.20,
-    "sahi_det_conf":      0.35,
+    "sahi_overlap":       0.20,            # 过低易碎框；建议 0.20~0.25
+    "sahi_det_conf":      0.35,            # 过低误检增多；建议 ≥0.30
     "sahi_batch_size":    8,
     "sahi_crop_padding":  15,
     "sahi_output_dir":    "sahi_output",
     # ── SAHI 检测后处理（去误检 + 剔除边缘不完整目标）──────────────
-    "sahi_ios_thresh":       0.65,   # IoS 包含抑制阈值；<=0 关闭
+    "sahi_ios_thresh":       0.60,   # IoS；0.8 过严易漏抑制，建议 0.55~0.65
     "sahi_min_area_ratio":   0.45,   # 面积过滤：相对中位面积最小比例；<=0 关闭
-    "sahi_max_aspect_ratio": 2.5,    # 长宽比上限 max(w,h)/min(w,h)；<=0 关闭
+    "sahi_max_aspect_ratio": 1.5,    # 长宽比上限 max(w,h)/min(w,h)；<=0 关闭；钻石近正方形默认 1.5
     "sahi_edge_filter":      True,   # 是否剔除边缘不完整钻石
-    "sahi_edge_margin_px":   20,     # 边缘边距（像素）；框触边距带内即剔除
+    "sahi_edge_margin_px":   20,     # 边缘边距（像素）；过小几乎无效
 }
 
 _DEFAULT_CFG_DEPLOY: Dict = {
     **_DEFAULT_CFG_FULL,
-    "pt_path": "",  # 机台不打包 PyTorch 权重；大图 SAHI 页不显示
+    "pt_path": "",  # 机台分类不使用 .pt；YOLO 权重见 detect_weights/best.pt
+    "yolo_path": "detect_weights/best.pt",
 }
 
 
@@ -301,6 +316,11 @@ QProgressBar{
     height:10px; text-align:center;
 }
 QProgressBar::chunk{ background:#42A5F5; border-radius:4px; }
+QProgressBar#sahi_pbar{
+    min-height:28px; height:28px; font-size:12px; color:#263238;
+    text-align:center; padding:0 6px;
+}
+QProgressBar#sahi_pbar::chunk{ border-radius:4px; }
 QTextEdit#log{
     background:#1A1A2E; color:#A8D8A8; font-size:12px;
     font-family:Consolas,'Courier New',monospace; border:none;
@@ -512,7 +532,8 @@ class SahiPipelineWorker(QThread):
 
     Signals:
         log_line(str)          — 单行日志
-        progress(int, int)     — (当前图像序号, 总图像数)
+        progress(int, int)     — 细粒度进度 (当前步, 总步=图像数×4)
+        stage_msg(str)         — 当前阶段文案
         image_done(int, dict)  — 单张完成 (序号, 统计字典)
         finished_all(list)     — 全部完成，携带所有统计字典列表
         error(str)             — 致命错误
@@ -520,6 +541,7 @@ class SahiPipelineWorker(QThread):
 
     log_line   = pyqtSignal(str)
     progress   = pyqtSignal(int, int)
+    stage_msg  = pyqtSignal(str)
     image_done = pyqtSignal(int, dict)
     finished_all = pyqtSignal(list)
     error        = pyqtSignal(str)
@@ -536,9 +558,9 @@ class SahiPipelineWorker(QThread):
         det_conf: float = 0.35,
         batch_size: int = 8,
         crop_padding: int = 15,
-        ios_thresh: float = 0.65,
+        ios_thresh: float = 0.60,
         min_area_ratio: float = 0.45,
-        max_aspect_ratio: float = 2.5,
+        max_aspect_ratio: float = 1.5,
         edge_filter: bool = True,
         edge_margin_px: int = 20,
     ):
@@ -599,13 +621,21 @@ class SahiPipelineWorker(QThread):
             crop_padding=self.crop_padding,
         )
 
-        # ── 逐张处理 ──────────────────────────────────────────────
+        # ── 逐张处理（每张 4 步：读图/检测/裁剪分类/保存）────────
         all_stats: List[dict] = []
         total = len(self.img_paths)
+        steps_per_image = 4
+        total_steps = max(1, total * steps_per_image)
+
         for i, img_path in enumerate(self.img_paths):
             if self.stop_flag:
                 self.log_line.emit("已停止")
+                self.stage_msg.emit("已停止")
                 break
+
+            name = Path(img_path).name
+            self.stage_msg.emit(f"[{i + 1}/{total}] {name}")
+            self.log_line.emit(f"━━━ [{i + 1}/{total}] {name} ━━━")
 
             def _log(msg, _i=i):
                 self.log_line.emit(msg)
@@ -613,11 +643,21 @@ class SahiPipelineWorker(QThread):
             def _should_stop():
                 return self.stop_flag
 
+            def _stage(msg: str, _i=i, _name=name):
+                self.stage_msg.emit(f"[{_i + 1}/{total}] {msg}")
+
+            def _progress(step: int, _total_stage: int, _i=i):
+                # step 0..4 → 映射到该图已完成的步数
+                done = _i * steps_per_image + min(max(step, 0), steps_per_image)
+                self.progress.emit(done, total_steps)
+
             try:
                 stats = pipeline.process_image(
                     img_path,
+                    progress_cb=_progress,
                     log_cb=_log,
                     should_stop=_should_stop,
+                    stage_cb=_stage,
                 )
                 all_stats.append(stats)
                 self.image_done.emit(i, stats)
@@ -630,8 +670,12 @@ class SahiPipelineWorker(QThread):
                 }
                 all_stats.append(err_stats)
                 self.log_line.emit(f"处理失败: {exc}")
+                self.progress.emit((i + 1) * steps_per_image, total_steps)
 
-            self.progress.emit(i + 1, total)
+        self.stage_msg.emit("处理完成" if not self.stop_flag else "已停止")
+        self.progress.emit(total_steps if all_stats and not self.stop_flag else
+                           min(len(all_stats) * steps_per_image, total_steps),
+                           total_steps)
 
         # ── 保存汇总 CSV ──────────────────────────────────────────
         if all_stats:
@@ -2199,6 +2243,10 @@ class CorrectionPage(QWidget):
     """
     误分类修正页 — 处理 flagged=True 且未 correction_saved 的条目。
 
+    数据来源:
+      · 「结果管理」送入的误检
+      · 「选择文件夹」导入的本地图像（待重新打标签）
+
     重新标记模式（默认）:
       · 左侧大图 + 类别大按钮，单击即归档到 corrections/ 并 pop 出 results
       · 右侧待修正列表，切换当前处理的图像
@@ -2237,6 +2285,15 @@ class CorrectionPage(QWidget):
         self.lbl_count.setStyleSheet("color:#E65100;font-weight:bold;")
         hdr.addWidget(self.lbl_count)
 
+        btn_import = _mk_btn("选择文件夹", "flat", 118)
+        btn_import.setMinimumWidth(118)
+        btn_import.setToolTip(
+            "选择文件夹，将其内图像导入为待重新打标签的训练样本"
+            "（可含子文件夹；归档后进入 corrections/ 供再训练）"
+        )
+        btn_import.clicked.connect(self._import_folder)
+        hdr.addWidget(btn_import)
+
         self.btn_mark_view = _mk_btn("重新标记", "primary", 118)
         self.btn_mark_view.setMinimumWidth(118)
         self.btn_mark_view.clicked.connect(lambda: self._switch_view(self._MARK_VIEW))
@@ -2267,6 +2324,7 @@ class CorrectionPage(QWidget):
         left.setSpacing(10)
 
         self.lbl_mark_hint = QLabel(
+            "可从「结果管理」送入误检，或点「选择文件夹」导入本地图像后重新打标签。"
             "点击正确类别即归档至 corrections/ 对应文件夹，并移出待修正列表。"
         )
         self.lbl_mark_hint.setStyleSheet("color:#546E7A;font-size:12px;")
@@ -2433,8 +2491,92 @@ class CorrectionPage(QWidget):
         else:
             self._refresh_list_view()
 
+    def _import_folder(self):
+        """
+        选择文件夹，扫描其中图像并加入待修正队列（flagged=True）。
+
+        不跑推理：类别默认为「待标注」；若父目录名恰好是引擎五类之一，
+        则用作提示（仍需用户点击确认归档）。归档逻辑与误检修正相同。
+        """
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择待重新打标签的图像文件夹"
+        )
+        if not folder:
+            return
+
+        root = Path(folder)
+        imgs = sorted(
+            f for f in root.rglob("*")
+            if f.is_file() and f.suffix.lower() in IMG_EXTS
+        )
+        if not imgs:
+            QMessageBox.information(
+                self, "提示",
+                f"未在以下目录找到图像：\n{folder}\n\n"
+                f"支持格式：{', '.join(sorted(IMG_EXTS))}",
+            )
+            return
+
+        known = list(self.state.engine.classes) if self.state.engine else []
+        known_set = set(known)
+        added = 0
+        skipped_dup = 0
+
+        existing_flagged = {
+            _normalize_image_path(r["path"]).lower()
+            for r in self.state.results
+            if r.get("flagged") and not r.get("correction_saved")
+        }
+
+        for img_path in imgs:
+            path_str = _normalize_image_path(str(img_path))
+            key = path_str.lower()
+            if key in existing_flagged:
+                skipped_dup += 1
+                continue
+
+            parent = img_path.parent.name
+            hint_cls = parent if parent in known_set else "待标注"
+            r = _ensure_result_meta({
+                "path": path_str,
+                "class": hint_cls,
+                "class_idx": known.index(hint_cls) if hint_cls in known_set else -1,
+                "confidence": 0.0,
+                "max_class": hint_cls,
+                "max_confidence": 0.0,
+                "all_scores": {},
+                "elapsed_ms": 0.0,
+                "flagged": True,
+                "from_folder_import": True,
+            })
+            _upsert_result(self.state.results, r)
+            # upsert 可能保留旧 flagged；强制进入待修正队列
+            for existing in self.state.results:
+                if _normalize_image_path(existing["path"]).lower() == key:
+                    existing["flagged"] = True
+                    existing["correction_saved"] = False
+                    existing["from_folder_import"] = True
+                    if not existing.get("class") or existing["class"] in ("ERROR",):
+                        existing["class"] = hint_cls
+                    break
+            existing_flagged.add(key)
+            added += 1
+
+        self.refresh()
+        self._switch_view(self._MARK_VIEW)
+
+        parts = [f"已导入 {added} 张待标注图像"]
+        if skipped_dup:
+            parts.append(f"跳过已在队列中的 {skipped_dup} 张")
+        msg = "，".join(parts) + f"。\n来源：{folder}"
+        self.saved_signal.emit(parts[0] + (f"（跳过重复 {skipped_dup}）" if skipped_dup else ""))
+        QMessageBox.information(self, "导入完成", msg)
+
     def _flagged_items(self) -> List[tuple]:
-        return [(i, r) for i, r in enumerate(self.state.results) if r.get("flagged")]
+        return [
+            (i, r) for i, r in enumerate(self.state.results)
+            if r.get("flagged") and not r.get("correction_saved")
+        ]
 
     def _update_count_label(self):
         flagged = self._flagged_items()
@@ -2454,7 +2596,10 @@ class CorrectionPage(QWidget):
             icon = self.style().standardIcon(QStyle.SP_FileDialogContentsView)
             item.setIcon(icon)
             name = Path(r["path"]).name
-            item.setText(f"{name}\n预测：{r['class']}")
+            if r.get("from_folder_import") or r.get("class") == "待标注":
+                item.setText(f"{name}\n来源：文件夹导入")
+            else:
+                item.setText(f"{name}\n预测：{r['class']}")
             item.setSizeHint(QSize(0, 58))
             item.setToolTip(r["path"])
             self.mark_list.addItem(item)
@@ -2481,7 +2626,11 @@ class CorrectionPage(QWidget):
 
     def _show_mark_empty(self):
         self.img_large.clear()
-        self.img_large.setText("暂无待修正图像\n\n请先在「结果管理」中点击「送修正」")
+        self.img_large.setText(
+            "暂无待修正图像\n\n"
+            "· 在「结果管理」中点击「送修正」\n"
+            "· 或本页点击「选择文件夹」导入待打标签图像"
+        )
         self.lbl_mark_file.setText("")
         self.lbl_mark_pred.setText("")
         self.lbl_mark_progress.setText("")
@@ -2506,9 +2655,18 @@ class CorrectionPage(QWidget):
             )
 
         self.lbl_mark_file.setText(Path(path).name)
-        self.lbl_mark_pred.setText(
-            f"预测：{r['class']}  ({r['confidence']*100:.1f}%)"
-        )
+        if r.get("from_folder_import") or r.get("class") == "待标注":
+            hint = r.get("class") or "待标注"
+            if hint != "待标注":
+                self.lbl_mark_pred.setText(
+                    f"来源：文件夹导入 · 目录提示类别：{hint}"
+                )
+            else:
+                self.lbl_mark_pred.setText("来源：文件夹导入（待重新打标签）")
+        else:
+            self.lbl_mark_pred.setText(
+                f"预测：{r['class']}  ({r['confidence']*100:.1f}%)"
+            )
 
         self.lbl_mark_progress.setText(
             f"第 {pos + 1} / {len(self._flagged_indices)} 张"
@@ -3190,8 +3348,10 @@ class SettingsPage(QWidget):
         self.sp_ios.setRange(0.0, 1.0)
         self.sp_ios.setSingleStep(0.05)
         self.sp_ios.setDecimals(2)
-        self.sp_ios.setValue(self.state.config.get("sahi_ios_thresh", 0.65))
-        self.sp_ios.setToolTip("交集/较小框面积 ≥ 此值判为包含冗余并去重；0 表示关闭")
+        self.sp_ios.setValue(self.state.config.get("sahi_ios_thresh", 0.60))
+        self.sp_ios.setToolTip(
+            "交集/较小框面积 ≥ 此值判为包含冗余并去掉较小框；建议 0.55~0.65；0 关闭"
+        )
         _tune_spinbox(self.sp_ios)
         ppl.addRow("IoS 包含抑制:", self.sp_ios)
 
@@ -3208,7 +3368,7 @@ class SettingsPage(QWidget):
         self.sp_max_aspect.setRange(0.0, 20.0)
         self.sp_max_aspect.setSingleStep(0.1)
         self.sp_max_aspect.setDecimals(1)
-        self.sp_max_aspect.setValue(float(self.state.config.get("sahi_max_aspect_ratio", 2.5)))
+        self.sp_max_aspect.setValue(float(self.state.config.get("sahi_max_aspect_ratio", 1.5)))
         self.sp_max_aspect.setToolTip(
             "长宽比 = max(宽,高)/min(宽,高)；超过此值的细长框视为异常并剔除；0 表示关闭"
         )
@@ -3481,9 +3641,18 @@ class DiamondDetectPage(QWidget):
         root.addLayout(ctrl)
 
         self.pbar = QProgressBar()
+        self.pbar.setObjectName("sahi_pbar")
         self.pbar.setVisible(False)
-        self.pbar.setFixedHeight(12)
+        self.pbar.setFixedHeight(28)
+        self.pbar.setTextVisible(True)
+        self.pbar.setFormat("%v / %m")
         root.addWidget(self.pbar)
+
+        self.lbl_stage = QLabel("")
+        self.lbl_stage.setVisible(False)
+        self.lbl_stage.setStyleSheet("color:#546E7A;font-size:12px;")
+        self.lbl_stage.setWordWrap(True)
+        root.addWidget(self.lbl_stage)
 
         # ── 结果统计表格 ──────────────────────────────────────────
         result_grp = QGroupBox("结果统计")
@@ -3610,9 +3779,12 @@ class DiamondDetectPage(QWidget):
         self.table.setRowCount(0)
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        n_img = len(self._img_paths)
         self.pbar.setVisible(True)
-        self.pbar.setMaximum(len(self._img_paths))
+        self.pbar.setMaximum(max(1, n_img * 4))
         self.pbar.setValue(0)
+        self.lbl_stage.setVisible(True)
+        self.lbl_stage.setText("准备中…")
 
         self.worker = SahiPipelineWorker(
             yolo_path=yolo_path,
@@ -3625,13 +3797,14 @@ class DiamondDetectPage(QWidget):
             det_conf=cfg.get("sahi_det_conf", 0.35),
             batch_size=cfg.get("sahi_batch_size", 8),
             crop_padding=cfg.get("sahi_crop_padding", 15),
-            ios_thresh=cfg.get("sahi_ios_thresh", 0.65),
+            ios_thresh=cfg.get("sahi_ios_thresh", 0.60),
             min_area_ratio=cfg.get("sahi_min_area_ratio", 0.45),
-            max_aspect_ratio=cfg.get("sahi_max_aspect_ratio", 2.5),
+            max_aspect_ratio=cfg.get("sahi_max_aspect_ratio", 1.5),
             edge_filter=cfg.get("sahi_edge_filter", True),
             edge_margin_px=cfg.get("sahi_edge_margin_px", 20),
         )
         self.worker.progress.connect(self._on_progress)
+        self.worker.stage_msg.connect(self._on_stage_msg)
         self.worker.image_done.connect(self._on_image_done)
         self.worker.finished_all.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
@@ -3645,7 +3818,12 @@ class DiamondDetectPage(QWidget):
     # ── 信号回调 ──────────────────────────────────────────────────
 
     def _on_progress(self, current: int, total: int):
-        self.pbar.setValue(current)
+        if self.pbar.maximum() != total and total > 0:
+            self.pbar.setMaximum(total)
+        self.pbar.setValue(min(current, total))
+
+    def _on_stage_msg(self, msg: str):
+        self.lbl_stage.setText(msg)
 
     def _on_image_done(self, idx: int, stats: dict):
         row = self.table.rowCount()
@@ -3655,6 +3833,15 @@ class DiamondDetectPage(QWidget):
         )
         if not dist and stats.get("error"):
             dist = f"错误: {stats['error'][:40]}"
+        # 后处理剔除摘要（便于确认 IoS 等是否生效）
+        skipped = (
+            int(stats.get("contained_skipped", 0))
+            + int(stats.get("small_skipped", 0))
+            + int(stats.get("aspect_skipped", 0))
+            + int(stats.get("edge_skipped", 0))
+        )
+        if skipped and not stats.get("error"):
+            dist = (dist + " · " if dist else "") + f"后处理剔除 {skipped}"
         items = [
             stats.get("image", ""),
             str(stats.get("total_diamonds", 0)),
@@ -3672,6 +3859,8 @@ class DiamondDetectPage(QWidget):
 
     def _on_finished(self, all_stats: list):
         self.pbar.setVisible(False)
+        self.lbl_stage.setVisible(False)
+        self.lbl_stage.setText("")
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._update_total()
@@ -3692,6 +3881,8 @@ class DiamondDetectPage(QWidget):
 
     def _on_error(self, msg: str):
         self.pbar.setVisible(False)
+        self.lbl_stage.setVisible(False)
+        self.lbl_stage.setText("")
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         QMessageBox.critical(self, "处理出错", msg)
@@ -3722,7 +3913,7 @@ class MainWindow(QMainWindow):
       · 启动时 _auto_load_model 尝试加载 checkpoints
       · 管理员密码验证（再训练 / 设置页共用一把锁）
 
-    页面（开发版 6 页，机台版 5 页 — 钻石检测分类仅开发版显示入口）:
+    页面（开发 / 机台均为 6 页；机台分类走 ONNX，检测仍为 SAHI/YOLO）:
       0 钻石检测分类(SAHI) / 1 缺陷检测 / 2 结果管理
       3 误分类修正 / 4 模型再训练 / 5 设置(分类配置 + 切片推理配置)
 
@@ -3733,6 +3924,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.state = AppState()
         self.setWindowTitle(APP_NAME)
+        icon = _load_app_icon()
+        if icon is not None:
+            self.setWindowIcon(icon)
         self.setMinimumSize(1200, 800)
         self.resize(1440, 920)
         self._build_ui()
@@ -3767,7 +3961,7 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("background:#CFD8DC;")
         sb_lay.addWidget(sep)
 
-        # 导航项顺序与 NAV_* 常量一致；钻石检测分类位于第一位（仅开发版显示入口）
+        # 导航项顺序与 NAV_* 常量一致；钻石检测分类位于第一位
         nav_items = [
             ("  💎  钻石检测分类", NAV_DIAMOND),
             ("  🔍  缺陷检测",     NAV_DETECT),
@@ -3776,9 +3970,6 @@ class MainWindow(QMainWindow):
             ("  🔄  模型再训练",   NAV_RETRAIN),
             ("  ⚙️   设 置",       NAV_SETTINGS),
         ]
-        # 机台版（DEPLOY_ONNX_ONLY）不显示钻石检测分类入口
-        if DEPLOY_ONNX_ONLY:
-            nav_items = [it for it in nav_items if it[1] != NAV_DIAMOND]
         self._nav_btns = [None] * 6  # 按 NAV 索引存放按钮，便于按索引访问
         for label, idx in nav_items:
             btn = QPushButton(label)
@@ -3794,7 +3985,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
 
         # 按 NAV_* 索引顺序添加页面，保证 setCurrentIndex(NAV_xxx) 一一对应
-        self.p_diamond  = DiamondDetectPage(self.state) if not DEPLOY_ONNX_ONLY else QWidget()
+        self.p_diamond  = DiamondDetectPage(self.state)
         self.p_detect   = DetectionPage(self.state)
         self.p_results  = ResultsPage(self.state)
         self.p_correct  = CorrectionPage(self.state)
@@ -3833,8 +4024,8 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self._lbl_device, 1)
         self.statusBar().addPermanentWidget(self._lbl_badge)
 
-        # 初始页：开发版默认钻石检测分类，机台版默认缺陷检测
-        self._switch_page(NAV_DIAMOND if not DEPLOY_ONNX_ONLY else NAV_DETECT)
+        # 初始页：钻石检测分类
+        self._switch_page(NAV_DIAMOND)
         self._update_correction_badge()
 
     def _switch_page(self, idx: int):
@@ -3964,6 +4155,9 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")       # 跨平台统一基础风格，再叠加自定义 QSS
     app.setStyleSheet(STYLE)
+    icon = _load_app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
 
     # 中文字体回退链，避免 Linux/macOS 缺字
     font = QFont()

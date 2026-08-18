@@ -12,7 +12,7 @@ scikit-learn>=1.0.0
 # PyQt5 GUI
 PyQt5>=5.15.0
 
-# 开发版钻石检测分类（SAHI / YOLO；机台 exe 不含）
+# 钻石检测分类（SAHI / YOLO；开发与机台 exe 均需要）
 ultralytics>=8.0.0
 opencv-python>=4.5.0
 

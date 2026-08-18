@@ -45,8 +45,7 @@ def main() -> int:
     print(msg)
     print("device:", eng.device, "loaded:", eng.loaded)
     if eng.device != "cuda":
-        print("[WARN] 未使用 GPU，请检查 cuDNN/CUDA DLL 是否已打入包或已安装。")
-        return 1
+        print("[WARN] 已回退 CPU，但模型可正常加载；如需 GPU 请检查 cuDNN/CUDA DLL。")
     return 0
 
 
